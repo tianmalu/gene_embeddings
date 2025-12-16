@@ -8,6 +8,7 @@ import os
 import torch
 from transformers import pipeline
 from transformers import AutoTokenizer, AutoModel
+
 def gene_symbol_to_fasta(fasta_path, genes):
     """
     Inputs:
@@ -37,6 +38,8 @@ def gene_symbol_to_fasta(fasta_path, genes):
             gene2seq[gene] = seq
 
     return gene2seq
+
+
 
 def generate_esm2_embeddings(gene2seq):
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -71,6 +74,8 @@ def generate_esm2_embeddings(gene2seq):
     if 'emb' in locals():
         print("Embedding dim:", emb.shape[0])
 
+
+
 if __name__ == "__main__":
     # ---------------- Load gene symbols from HPO labels ----------------
     hpo_path = "../dataset/genes_to_phenotype.txt"
@@ -88,5 +93,16 @@ if __name__ == "__main__":
     with open("../dataset/gene2seq.pkl", "wb") as f:
         pickle.dump(gene2seq, f)
     
+    gene2rna = gene_to_rna_from_cdna(
+        cdna_fasta="../dataset/Homo_sapiens.GRCh38.cdna.all.fa",
+        genes=genes
+    )
+    print(gene2rna["AARS1"])
+    print("Genes with RNA sequence:", len(gene2rna))
+    print("Example AARS1 RNA length:", len(gene2rna["AARS1"]))
+    with open("../dataset/gene2rna.pkl", "wb") as f:
+        pickle.dump(gene2rna, f)
+    
     # ---------------- Generate embeddings ----------------
-    generate_esm2_embeddings(gene2seq)
+    # generate_esm2_embeddings(gene2seq)
+    generate_orthrus_embeddings(gene2rna)

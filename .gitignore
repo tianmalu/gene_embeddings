@@ -218,3 +218,5 @@ venv/
 
 dataset/
 *.pth
+
+src/=0.5
