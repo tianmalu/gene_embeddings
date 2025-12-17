@@ -9,7 +9,7 @@ from sklearn.metrics import roc_auc_score, average_precision_score
 HIDDEN_DIM = 1000
 BATCH_SIZE = 64
 EPOCHS = 20
-LEARNING_RATE = 0.001
+LEARNING_RATE = 0.0001
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 def evaluate(model, data_loader, criterion, device):
@@ -85,7 +85,6 @@ if __name__ == "__main__":
     print("\nStarting Training...")
     best_val_auprc = 0.0
     
-    # 用于记录训练历史
     train_losses = []
     val_losses = []
     train_auprcs = []
@@ -109,11 +108,9 @@ if __name__ == "__main__":
             
         avg_train_loss = total_loss / len(train_loader)
         
-        # 计算训练集AUPRC
         train_loss, train_auprc, _, _ = evaluate(model, train_loader, criterion, DEVICE)
         avg_val_loss, val_auprc, _, _ = evaluate(model, val_loader, criterion, DEVICE)
         
-        # 记录历史
         train_losses.append(train_loss)
         val_losses.append(avg_val_loss)
         train_auprcs.append(train_auprc)
@@ -139,29 +136,23 @@ if __name__ == "__main__":
     print(f"Final Test AUPRC (Best Model): {test_auprc:.4f}")
     print("---------------------------------------------")
 
-    # 生成可视化
-    print("\n生成训练可视化图表...")
+    print("\nGenerating training visualization plots...")
     
-    # 1. 训练曲线
     plot_training_curves(train_losses, val_losses, train_auprcs, val_auprcs, 
                         save_path='training_curves.png')
     
-    # 2. ROC曲线
     plot_roc_curves(test_targets, test_outputs, num_classes_to_plot=5, 
                    save_path='roc_curves.png')
     
-    # 3. 预测分布
     plot_prediction_distribution(test_targets, test_outputs, 
                                 save_path='prediction_distribution.png')
     
-    # 4. Top-K准确率
     plot_top_k_accuracy(test_targets, test_outputs, k_values=[1, 3, 5, 10, 20, 50], 
                        save_path='top_k_accuracy.png')
     
-    # 5. 每类性能
     plot_per_class_performance(test_targets, test_outputs, top_n=20, 
                               save_path='per_class_performance.png')
     
-    print("\n所有可视化图表已生成完成！")
+    print("\nAll visualization plots have been generated!")
 
     
