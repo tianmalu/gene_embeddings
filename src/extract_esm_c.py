@@ -1,14 +1,16 @@
 import os
-import requests
+import re
+import pandas as pd
 import numpy as np
 import torch
-import mygene
+from Bio import SeqIO
 from esm.models.esmc import ESMC
 from esm.sdk.api import ESMProtein, LogitsConfig
-from utils import load_omics_embedding, load_hpo_labels
+from utils import load_omics_embedding, map_ensembl_to_symbol, load_hpo_labels
 
 # Settings
-OUT_DIR = "../dataset/esm_c_embeddings"
+OUT_DIR = "dataset/esm_c_embeddings"
+UNIPROT_FASTA = "dataset/uniprot_human.fasta"  # Download from UniProt
 # ESM-3 C-series public checkpoints
 #   "esmc_300m"  (smaller)
 #   "esmc_600m"  (larger)
@@ -19,78 +21,29 @@ MAX_SEQ_LEN = 1024
 MIN_GENES_PER_HPO = 20
 
 
-def map_gene_id_to_symbol(gene_ids: list[str]) -> dict[str, str]:
-    """Map Ensembl gene IDs to official gene symbols using mygene."""
-    mg = mygene.MyGeneInfo()
-    res = mg.querymany(
-        gene_ids,
-        scopes="ensembl.gene",
-        fields="symbol",
-        species="human",
-        as_dataframe=True,
-        returnall=False,
-        verbose=False,
-    )
+def gene_symbol_to_protein_fasta(fasta_path: str, gene_symbols: set[str]) -> dict[str, str]:
+    """Load protein sequences from UniProt FASTA, keyed by gene symbol (GN=).
+    Returns the longest sequence if multiple entries exist for the same gene."""
+    gene2seq = {}
+    gn_re = re.compile(r"\bGN=([A-Za-z0-9\-]+)\b")
 
-    mapping = {}
-    for ensg, row in res.iterrows():
-        sym = row.get("symbol")
-        ensg_id = ensg[0] if isinstance(ensg, tuple) else ensg
-        if isinstance(sym, str):
-            mapping[ensg_id] = sym
-    return mapping
+    for record in SeqIO.parse(fasta_path, "fasta"):
+        desc = record.description
+        m = gn_re.search(desc)
+        if not m:
+            continue
 
+        gene = m.group(1)
+        if gene not in gene_symbols:
+            continue
 
-def map_symbol_to_uniprot(gene_symbols: list[str]) -> dict[str, str]:
-    """Map gene symbols to a UniProt accession (Swiss-Prot preferred, else TrEMBL)."""
-    mg = mygene.MyGeneInfo()
-    res = mg.querymany(
-        gene_symbols,
-        scopes="symbol",
-        fields="uniprot.Swiss-Prot,uniprot.TrEMBL",
-        species="human",
-        as_dataframe=True,
-        returnall=False,
-        verbose=False,
-    )
+        seq = str(record.seq)
 
-    mapping = {}
-    for sym, row in res.iterrows():
-        acc = None
-        swiss = row.get("uniprot.Swiss-Prot")
-        trembl = row.get("uniprot.TrEMBL")
+        # Take the longest sequence if multiple entries exist
+        if gene not in gene2seq or len(seq) > len(gene2seq[gene]):
+            gene2seq[gene] = seq
 
-        if isinstance(swiss, list):
-            acc = swiss[0]
-        elif isinstance(swiss, str):
-            acc = swiss
-        elif isinstance(trembl, list):
-            acc = trembl[0]
-        elif isinstance(trembl, str):
-            acc = trembl
-
-        sym_key = sym[0] if isinstance(sym, tuple) else sym
-        if acc:
-            mapping[sym_key] = acc
-    return mapping
-
-
-def fetch_uniprot_fasta(accession: str) -> str | None:
-    url = f"https://rest.uniprot.org/uniprotkb/{accession}.fasta"
-    try:
-        r = requests.get(url, timeout=30)
-        r.raise_for_status()
-    except requests.RequestException as exc:
-        print(f"Failed to fetch FASTA for {accession}: {exc}")
-        return None
-    return r.text
-
-
-def fasta_to_seq(fasta_str: str) -> str | None:
-    lines = [l.strip() for l in fasta_str.splitlines() if l.strip()]
-    seq_lines = [l for l in lines if not l.startswith(">")]  # drop header
-    seq = "".join(seq_lines)
-    return seq if seq else None
+    return gene2seq
 
 
 def load_model():
@@ -100,107 +53,91 @@ def load_model():
     return client
 
 
-def embed_sequence(client, seq: str) -> np.ndarray:
-    if len(seq) > MAX_SEQ_LEN:
-        seq = seq[:MAX_SEQ_LEN]
-
-    protein = ESMProtein(sequence=seq)
-
-    with torch.no_grad():
-        protein_tensor = client.encode(protein).to(DEVICE)
-        logits_output = client.logits(
-            protein_tensor,
-            LogitsConfig(sequence=True, return_embeddings=True),
-        )
-
-    embeddings = logits_output.embeddings  # shape: (1, L, D)
-    pooled = embeddings.squeeze(0).mean(dim=0).cpu().numpy()
-    return pooled
-
-
 def main():
     os.makedirs(OUT_DIR, exist_ok=True)
 
-    df_emb = load_omics_embedding()  # reuses utils; index is gene_id
-    gene_ids = df_emb.index.tolist()
-    total_gene_ids = len(gene_ids)
-    print(f"Loaded {total_gene_ids} gene IDs from omics embeddings")
+    # Load omics genes and map to symbols
+    df_emb = load_omics_embedding()
+    df_emb = map_ensembl_to_symbol(df_emb)
+    omics_syms = set(df_emb.index.tolist())
+    print("Omics genes (symbols):", len(omics_syms))
 
-    ensg2sym = map_gene_id_to_symbol(gene_ids)
-    mapped_symbols = len(ensg2sym)
-    print(f"Mapped {mapped_symbols} Ensembl IDs to symbols; missing {total_gene_ids - mapped_symbols}")
-
+    # Filter HPO genes (>=MIN_GENES_PER_HPO per term)
     gene2hpos = load_hpo_labels()
-    # Filter terms with >= MIN_GENES_PER_HPO
     hpo_counts = gene2hpos.explode().value_counts()
     keep_terms = set(hpo_counts[hpo_counts >= MIN_GENES_PER_HPO].index.tolist())
     hpo_syms = {g for g, terms in gene2hpos.items() if any(t in keep_terms for t in terms)}
-    print(f"HPO genes (after filtering terms with >= {MIN_GENES_PER_HPO} genes): {len(hpo_syms)}")
+    print("HPO genes (filtered):", len(hpo_syms))
 
-    genes_common = [gid for gid, sym in ensg2sym.items() if sym in hpo_syms]
-    print(f"Genes with both omics embeddings and filtered HPO labels: {len(genes_common)}")
+    # Intersect
+    genes_to_embed = omics_syms & hpo_syms
+    print("Genes to embed (omics ∩ HPO filtered):", len(genes_to_embed))
 
-    symbols_common = [ensg2sym[gid] for gid in genes_common]
-    sym2uniprot = map_symbol_to_uniprot(symbols_common)
-    print(f"Mapped {len(sym2uniprot)} symbols to UniProt; missing {len(symbols_common) - len(sym2uniprot)}")
+    # Load protein sequences from FASTA
+    if not os.path.exists(UNIPROT_FASTA):
+        raise FileNotFoundError(f"UniProt FASTA not found at {UNIPROT_FASTA}. Download from https://www.uniprot.org/help/downloads")
+    
+    gene2seq = gene_symbol_to_protein_fasta(UNIPROT_FASTA, genes_to_embed)
+    print(f"Loaded {len(gene2seq)} protein sequences from FASTA")
 
+    # Load model
     client = load_model()
 
+    # Generate embeddings
+    gene2emb = {}
     summary = []
-    status_counts = {"ok": 0, "no_uniprot": 0, "fetch_failed": 0, "no_sequence": 0, "embed_failed": 0, "skipped_existing": 0}
+    status_counts = {"ok": 0, "no_sequence": 0, "embed_failed": 0}
     first_shape_logged = False
 
-    for i, gene_id in enumerate(genes_common, 1):
-        out_path = os.path.join(OUT_DIR, f"{gene_id}.npy")
-        if os.path.exists(out_path):
-            status_counts["skipped_existing"] += 1
-            continue
-
-        sym = ensg2sym.get(gene_id)
-        acc = sym2uniprot.get(sym)
-        if not acc:
-            summary.append((gene_id, None, 0, "no_uniprot"))
-            status_counts["no_uniprot"] += 1
-            continue
-
-        fasta = fetch_uniprot_fasta(acc)
-        if not fasta:
-            summary.append((gene_id, acc, 0, "fetch_failed"))
-            status_counts["fetch_failed"] += 1
-            continue
-
-        seq = fasta_to_seq(fasta)
+    for i, gene in enumerate(genes_to_embed, 1):
+        seq = gene2seq.get(gene)
         if not seq:
-            summary.append((gene_id, acc, 0, "no_sequence"))
+            summary.append((gene, 0, "no_sequence"))
             status_counts["no_sequence"] += 1
             continue
 
         try:
-            emb = embed_sequence(client, seq)
-            np.save(out_path, emb)
-            summary.append((gene_id, acc, len(seq), "ok"))
+            if len(seq) > MAX_SEQ_LEN:
+                seq = seq[:MAX_SEQ_LEN]
+
+            protein = ESMProtein(sequence=seq)
+
+            with torch.no_grad():
+                protein_tensor = client.encode(protein).to(DEVICE)
+                logits_output = client.logits(
+                    protein_tensor,
+                    LogitsConfig(sequence=True, return_embeddings=True),
+                )
+
+            embeddings = logits_output.embeddings  # shape: (1, L, D)
+            emb = embeddings.squeeze(0).mean(dim=0).cpu().numpy()
+            gene2emb[gene] = emb
+            summary.append((gene, emb.shape[0], "ok"))
             status_counts["ok"] += 1
+            
             if not first_shape_logged:
-                print(f"First embedding shape: {emb.shape} (gene_id {gene_id}, symbol {sym})")
+                print(f"First embedding shape: {emb.shape}")
                 first_shape_logged = True
-        except Exception as exc:  # noqa: BLE001
-            print(f"Failed to embed {gene_id} ({acc}): {exc}")
-            summary.append((gene_id, acc, len(seq), "embed_failed"))
+
+        except Exception as e:
+            summary.append((gene, 0, "embed_failed"))
             status_counts["embed_failed"] += 1
+            print(f"Error generating embedding for {gene}: {e}")
 
-        if i % 10 == 0:
-            print(f"Processed {i}/{len(genes_common)} genes", end="\r")
+        if i % 50 == 0:
+            print(f"Processed {i}/{len(genes_to_embed)} genes", end="\r")
 
+    # Save summary
     summary_path = os.path.join(OUT_DIR, "embedding_summary.tsv")
-    pd.DataFrame(summary, columns=["gene_id", "uniprot_acc", "seq_len", "status"]).to_csv(
+    pd.DataFrame(summary, columns=["gene_symbol", "emb_dim", "status"]).to_csv(
         summary_path,
         sep="\t",
         index=False,
     )
     print(f"\nDone. Saved embeddings to {OUT_DIR}. Summary: {summary_path}")
     print(
-        "Status counts -> ok: {ok}, embed_failed: {embed_failed}, fetch_failed: {fetch_failed}, "
-        "no_sequence: {no_sequence}, no_uniprot: {no_uniprot}, skipped_existing: {skipped_existing}".format(**status_counts)
+        "Status counts -> ok: {ok}, embed_failed: {embed_failed}, "
+        "no_sequence: {no_sequence}".format(**status_counts)
     )
 
 
