@@ -6,7 +6,7 @@ import mygene
 # ---------- 1. Read Omics embedding ----------
 def load_omics_embedding(dataset_path="/p/scratch/hai_1134/reimt/dataset"):
     data_path = dataset_path
-    omic_path = "omics_embeddings"
+    omic_path = "/omics_embeddings"
     emb_path = data_path + omic_path + "/Supplementary_Table_S3_OMICS_EMB.tsv"
 
     df_emb = pd.read_csv(emb_path, sep="\t")

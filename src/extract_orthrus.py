@@ -21,7 +21,7 @@ except Exception:  # noqa: BLE001
 DEFAULT_DATASET_DIR = "/p/scratch/hai_1134/reimt/dataset"
 OUT_DIR = os.path.join(DEFAULT_DATASET_DIR, "orthrus_embeddings")
 CDNA_FASTA = os.path.join(DEFAULT_DATASET_DIR, "ensembl_human_cds.fasta")  # Download from Ensembl
-TRACK_TYPE = "4"  # choose "4" or "6"; six-track requires GenomeKit assets
+TRACK_TYPE = "6"  # choose "4" or "6"; six-track requires GenomeKit assets
 MIN_GENES_PER_HPO = 20
 GENOME_NAME = "gencode.v29"  # required for six-track via GenomeKit
 
@@ -268,12 +268,20 @@ if __name__ == "__main__":
         default=DEFAULT_DATASET_DIR,
         help="Path to dataset folder (contains ensembl_human_cds.fasta; outputs written under it)",
     )
+    parser.add_argument(
+        "--track-type",
+        type=str,
+        default=TRACK_TYPE,
+        choices=["4", "6"],
+        help="Orthrus track type to use: '4' (RNA one-hot) or '6' (GenomeKit six-track)",
+    )
     args = parser.parse_args()
 
     dataset_dir = os.path.abspath(args.dataset_dir)
     out_dir = os.path.join(dataset_dir, "orthrus_embeddings")
     cdna_fasta = os.path.join(dataset_dir, "ensembl_human_cds.fasta")
     gene2rna_path = os.path.join(dataset_dir, "gene2rna.pkl")
+    track_type = args.track_type
 
     # ---------------- Load omics genes and map to symbols ----------------
     df_emb = load_omics_embedding(dataset_dir)  # index: gene_id
@@ -306,4 +314,4 @@ if __name__ == "__main__":
     print(f"Saved gene2rna to: {gene2rna_path}")
     
     # ---------------- Generate embeddings ----------------
-    generate_orthrus_embeddings(gene2rna, track_type=TRACK_TYPE, out_dir=out_dir)
+    generate_orthrus_embeddings(gene2rna, track_type=track_type, out_dir=out_dir)
