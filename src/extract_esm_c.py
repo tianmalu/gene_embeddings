@@ -9,8 +9,8 @@ from esm.sdk.api import ESMProtein, LogitsConfig
 from utils import load_omics_embedding, map_ensembl_to_symbol, load_hpo_labels
 
 # Settings
-OUT_DIR = "dataset/esm_c_embeddings"
-UNIPROT_FASTA = "dataset/uniprot_human.fasta"  # Download from UniProt
+OUT_DIR = "/p/scratch/hai_1134/reimt/dataset/esm_c_embeddings"
+UNIPROT_FASTA = "/p/scratch/hai_1134/reimt/dataset/uniprot_human.fasta"  # Download from UniProt
 # ESM-3 C-series public checkpoints
 #   "esmc_300m"  (smaller)
 #   "esmc_600m"  (larger)
