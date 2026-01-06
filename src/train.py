@@ -8,7 +8,7 @@ from sklearn.metrics import roc_auc_score, average_precision_score
 
 HIDDEN_DIM = 1000
 BATCH_SIZE = 64
-EPOCHS = 20
+EPOCHS = 50
 LEARNING_RATE = 0.0001
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -56,7 +56,8 @@ class GeneHPODataset(Dataset):
 
 
 if __name__ == "__main__":
-    X_train, Y_train, X_val, Y_val, X_test, Y_test = split_data()
+    X_train, Y_train, X_val, Y_val, X_test, Y_test = split_data(use_esm2=True, fusion_mode="concat", esm2_model="650M")
+
 
     train_dataset = GeneHPODataset(X_train, Y_train)
     val_dataset   = GeneHPODataset(X_val, Y_val)

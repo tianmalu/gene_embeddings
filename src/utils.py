@@ -2,6 +2,7 @@ import pandas as pd
 import numpy as np
 from sklearn.model_selection import train_test_split
 import mygene
+import os
 
 # ---------- 1. Read Omics embedding ----------
 def load_omics_embedding():
@@ -18,6 +19,41 @@ def load_omics_embedding():
     emb_genes = df_emb.index.tolist()
     print("Embedding genes:", len(emb_genes), "dim =", X_emb.shape[1])
     return df_emb
+
+# ---------- 1.5 Read ESM2 embeddings ----------
+def load_esm2_embeddings(esm2_model="8M"):
+    """
+    Load ESM2 protein embeddings from .npy files.
+    
+    Args:
+        esm2_model: Which ESM2 model embeddings to load. Options:
+                    - "8M": esm2_t6_8M_UR50D (dim=320)
+                    - "650M": esm2_t33_650M_UR50D (dim=1280)
+    """
+    if esm2_model == "8M":
+        esm2_dir = "../dataset/esm2_embeddings"
+    elif esm2_model == "650M":
+        esm2_dir = "../dataset/esm2_embeddings_650M"
+    else:
+        raise ValueError(f"Unknown esm2_model: {esm2_model}. Use '8M' or '650M'.")
+    
+    gene2esm2 = {}
+    
+    if not os.path.exists(esm2_dir):
+        print(f"Warning: ESM2 embedding directory not found: {esm2_dir}")
+        return gene2esm2
+    
+    for fname in os.listdir(esm2_dir):
+        if fname.endswith(".npy"):
+            gene_symbol = fname.replace(".npy", "")
+            emb_path = os.path.join(esm2_dir, fname)
+            gene2esm2[gene_symbol] = np.load(emb_path)
+    
+    print(f"Loaded ESM2 ({esm2_model}) embeddings for {len(gene2esm2)} genes")
+    if gene2esm2:
+        sample_emb = next(iter(gene2esm2.values()))
+        print(f"ESM2 embedding dim = {sample_emb.shape[0]}")
+    return gene2esm2
 
 # ---------------- 2. Ensembl ID -> gene symbol ----------------
 def map_ensembl_to_symbol(df_emb):
@@ -59,9 +95,18 @@ def load_hpo_labels():
     return gene2hpos
 
 # ---------------- 4. Align genes with both embedding and HPO labels ----------------
-def align_genes(df_emb, gene2hpos):
-    genes_common = sorted(set(df_emb.index) & set(gene2hpos.index))
-    print("Genes with both embedding and HPO labels:", len(genes_common))
+def align_genes(df_emb, gene2hpos, gene2esm2=None):
+    """Align genes that have all required data (omics embedding, HPO labels, and optionally ESM2 embedding)"""
+    genes_with_omics_and_hpo = set(df_emb.index) & set(gene2hpos.index)
+    
+    if gene2esm2 is not None:
+        # Only keep genes that also have ESM2 embeddings
+        genes_common = sorted(genes_with_omics_and_hpo & set(gene2esm2.keys()))
+        print(f"Genes with omics embedding and HPO labels: {len(genes_with_omics_and_hpo)}")
+        print(f"Genes with all three (omics + HPO + ESM2): {len(genes_common)}")
+    else:
+        genes_common = sorted(genes_with_omics_and_hpo)
+        print("Genes with both embedding and HPO labels:", len(genes_common))
 
     hpo_terms = sorted({h for g in genes_common for h in gene2hpos[g]})
     hpo2idx = {h: i for i, h in enumerate(hpo_terms)}
@@ -70,15 +115,64 @@ def align_genes(df_emb, gene2hpos):
     return genes_common, hpo2idx, num_hpo
 
 # ---------------- 5. Generate X, Y matrices ----------------
-def split_data():
+def split_data(use_esm2=True, fusion_mode="concat", esm2_model="8M"):
+    """
+    Load embeddings and split data for training.
+    
+    Args:
+        use_esm2: If True, combine ESM2 embeddings with omics embeddings.
+                  If False, use only omics embeddings (original behavior).
+        fusion_mode: How to combine omics and ESM2 embeddings. Options:
+                     - "concat": Concatenate embeddings (default)
+                     - "add": Element-wise addition (with padding if dims differ)
+        esm2_model: Which ESM2 model embeddings to use. Options:
+                    - "8M": esm2_t6_8M_UR50D (dim=320)
+                    - "650M": esm2_t33_650M_UR50D (dim=1280)
+    """
     df_emb = load_omics_embedding()
     df_emb = map_ensembl_to_symbol(df_emb)
     gene2hpos = load_hpo_labels()
-    genes_common, hpo2idx, num_hpo = align_genes(df_emb, gene2hpos)
+    
+    # Load ESM2 embeddings if requested
+    gene2esm2 = None
+    if use_esm2:
+        gene2esm2 = load_esm2_embeddings(esm2_model=esm2_model)
+    
+    genes_common, hpo2idx, num_hpo = align_genes(df_emb, gene2hpos, gene2esm2)
     X_list, Y_list = [], []
+    
+    # Get dimensions for padding if using add mode
+    omics_dim = None
+    esm2_dim = None
+    if use_esm2 and gene2esm2 is not None and fusion_mode == "add":
+        sample_gene = genes_common[0]
+        omics_dim = df_emb.loc[sample_gene].values.shape[0]
+        esm2_dim = gene2esm2[sample_gene].shape[0]
+        max_dim = max(omics_dim, esm2_dim)
+        print(f"Fusion mode: {fusion_mode}")
+        print(f"  Omics dim: {omics_dim}, ESM2 dim: {esm2_dim}, Output dim: {max_dim}")
 
     for g in genes_common:
-        x = df_emb.loc[g].values.astype(np.float32)  
+        # Get omics embedding
+        x_omics = df_emb.loc[g].values.astype(np.float32)
+        
+        # Combine with ESM2 embedding if available
+        if use_esm2 and gene2esm2 is not None:
+            x_esm2 = gene2esm2[g].astype(np.float32)
+            
+            if fusion_mode == "concat":
+                x = np.concatenate([x_omics, x_esm2])
+            elif fusion_mode == "add":
+                # Pad shorter embedding to match longer one
+                max_dim = max(len(x_omics), len(x_esm2))
+                x_omics_padded = np.pad(x_omics, (0, max_dim - len(x_omics)), mode='constant')
+                x_esm2_padded = np.pad(x_esm2, (0, max_dim - len(x_esm2)), mode='constant')
+                x = x_omics_padded + x_esm2_padded
+            else:
+                raise ValueError(f"Unknown fusion_mode: {fusion_mode}. Use 'concat' or 'add'.")
+        else:
+            x = x_omics
+        
         y = np.zeros(num_hpo, dtype=np.float32)
         for h in gene2hpos[g]:
             idx = hpo2idx[h]
@@ -86,10 +180,15 @@ def split_data():
         X_list.append(x)
         Y_list.append(y)
 
-    X = np.stack(X_list)   # [N, 256]
+    X = np.stack(X_list)   # [N, 256 + 320] if concat, [N, max(256, 320)] if add
     Y = np.stack(Y_list)   # [N, num_hpo]
 
     print("X shape:", X.shape, "Y shape:", Y.shape)
+    if use_esm2:
+        if fusion_mode == "concat":
+            print(f"  -> Omics dim + ESM2 dim = {X.shape[1]} (concatenated)")
+        else:
+            print(f"  -> Output dim = {X.shape[1]} (element-wise add)")
 # ---------------- 6. Split train/val/test ----------------
     N = X.shape[0]
     indices = np.arange(N)
@@ -231,41 +330,43 @@ def plot_per_class_performance(y_true, y_pred, top_n=20, save_path='per_class_pe
     num_classes = y_true.shape[1]
     class_counts = y_true.sum(axis=0)
     
-    top_classes = np.argsort(class_counts)[-top_n:]
-    
-    auprcs = []
-    counts = []
-    
-    for class_idx in top_classes:
+    all_auprcs = []
+    for class_idx in range(num_classes):
         if class_counts[class_idx] > 0:
             try:
                 auprc = average_precision_score(y_true[:, class_idx], y_pred[:, class_idx])
+                all_auprcs.append(auprc)
             except:
-                auprc = 0.0
-            auprcs.append(auprc)
-            counts.append(int(class_counts[class_idx]))
+                pass
     
-    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 10))
+    all_auprcs = np.array(all_auprcs)
     
-    x_pos = np.arange(len(auprcs))
-    ax1.bar(x_pos, auprcs, color='steelblue', alpha=0.8, edgecolor='black')
-    ax1.set_ylabel('AUPRC', fontsize=12)
-    ax1.set_title(f'Per-Class AUPRC (Top {top_n} Classes by Sample Count)', 
-                  fontsize=14, fontweight='bold')
-    ax1.set_xticks(x_pos)
-    ax1.set_xticklabels([f'HPO {i}' for i in top_classes], rotation=45, ha='right')
-    ax1.grid(True, alpha=0.3, axis='y')
+    fig, ax = plt.subplots(figsize=(8, 6))
     
-    ax2.bar(x_pos, counts, color='coral', alpha=0.8, edgecolor='black')
-    ax2.set_xlabel('HPO Class', fontsize=12)
-    ax2.set_ylabel('Number of Positive Samples', fontsize=12)
-    ax2.set_title(f'Sample Distribution (Top {top_n} Classes)', fontsize=14, fontweight='bold')
-    ax2.set_xticks(x_pos)
-    ax2.set_xticklabels([f'HPO {i}' for i in top_classes], rotation=45, ha='right')
-    ax2.grid(True, alpha=0.3, axis='y')
+    bp = ax.boxplot(all_auprcs, patch_artist=True, vert=True)
+    
+    bp['boxes'][0].set_facecolor('steelblue')
+    bp['boxes'][0].set_alpha(0.7)
+    bp['medians'][0].set_color('red')
+    bp['medians'][0].set_linewidth(2)
+    
+    ax.set_ylabel('AUPRC', fontsize=12)
+    ax.set_title('Distribution of Per-Class AUPRC', fontsize=14, fontweight='bold')
+    ax.set_xticklabels(['All HPO Classes'])
+    ax.grid(True, alpha=0.3, axis='y')
+    
+    # 
+    stats_text = (f'Mean: {np.mean(all_auprcs):.4f}\n'
+                  f'Median: {np.median(all_auprcs):.4f}\n'
+                  f'Std: {np.std(all_auprcs):.4f}\n'
+                  f'Min: {np.min(all_auprcs):.4f}\n'
+                  f'Max: {np.max(all_auprcs):.4f}\n'
+                  f'N Classes: {len(all_auprcs)}')
+    ax.text(1.15, 0.5, stats_text, transform=ax.transAxes, fontsize=10,
+            verticalalignment='center', bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
     
     plt.tight_layout()
     plt.savefig(save_path, dpi=300, bbox_inches='tight')
     plt.close()
-    print(f"Per-class performance plot saved to: {save_path}")
+    print(f"AUPRC box plot saved to: {save_path}")
 
