@@ -1,5 +1,6 @@
 import argparse
 import os
+import pickle
 import re
 import pandas as pd
 import numpy as np
@@ -134,6 +135,13 @@ def main(dataset_dir: str = DEFAULT_DATASET_DIR, model_name: str = MODEL_NAME):
 
         if i % 50 == 0:
             print(f"Processed {i}/{len(genes_to_embed)} genes", end="\r")
+
+    # Save embeddings
+    safe_model_name = re.sub(r"[^A-Za-z0-9_.-]+", "_", model_name)
+    emb_path = os.path.join(out_dir, f"gene2emb_esm_c_{safe_model_name}.pkl")
+    with open(emb_path, "wb") as f:
+        pickle.dump(gene2emb, f)
+    print(f"\nSaved {len(gene2emb)} embeddings to {emb_path}")
 
     # Save summary
     summary_path = os.path.join(out_dir, "embedding_summary.tsv")
