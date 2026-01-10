@@ -34,6 +34,8 @@ def load_esm2_embeddings(esm2_model="8M"):
         esm2_dir = "../dataset/esm2_embeddings"
     elif esm2_model == "650M":
         esm2_dir = "../dataset/esm2_embeddings_650M"
+    elif esm2_model == "35M":
+        esm2_dir = "../dataset/esm2_embeddings_35M"
     else:
         raise ValueError(f"Unknown esm2_model: {esm2_model}. Use '8M' or '650M'.")
     

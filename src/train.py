@@ -8,9 +8,17 @@ from sklearn.metrics import roc_auc_score, average_precision_score
 
 HIDDEN_DIM = 1000
 BATCH_SIZE = 64
-EPOCHS = 50
+EPOCHS = 100
 LEARNING_RATE = 0.0001
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+import random
+SEED = 42
+torch.manual_seed(SEED)
+np.random.seed(SEED)
+random.seed(SEED)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed_all(SEED)
 
 def evaluate(model, data_loader, criterion, device):
     model.eval()
@@ -56,7 +64,7 @@ class GeneHPODataset(Dataset):
 
 
 if __name__ == "__main__":
-    X_train, Y_train, X_val, Y_val, X_test, Y_test = split_data(use_esm2=True, fusion_mode="concat", esm2_model="650M")
+    X_train, Y_train, X_val, Y_val, X_test, Y_test = split_data(use_esm2=True, fusion_mode="concat", esm2_model="8M")
 
 
     train_dataset = GeneHPODataset(X_train, Y_train)
@@ -128,6 +136,7 @@ if __name__ == "__main__":
             torch.save(model.state_dict(), 'best_hpo_classifier.pth')
 
     print("\nStarting Final Test...")
+    print("Loading best model from: best_hpo_classifier.pth")
     model.load_state_dict(torch.load('best_hpo_classifier.pth'))
     
     test_loss, test_auprc, test_outputs, test_targets = evaluate(model, test_loader, criterion, DEVICE)
@@ -151,8 +160,9 @@ if __name__ == "__main__":
     plot_top_k_accuracy(test_targets, test_outputs, k_values=[1, 3, 5, 10, 20, 50], 
                        save_path='top_k_accuracy.png')
     
+    print("\nGenerating AUPRC box plot (Best Model)...")
     plot_per_class_performance(test_targets, test_outputs, top_n=20, 
-                              save_path='per_class_performance.png')
+                              save_path='auprc_boxplot.png')
     
     print("\nAll visualization plots have been generated!")
 

@@ -111,6 +111,6 @@ if __name__ == "__main__":
     # ---------------- Generate ESM2 embeddings ----------------
     generate_esm2_embeddings(
         gene2seq, 
-        output_dir="../dataset/esm2_embeddings_650M",
-        model_name="facebook/esm2_t33_650M_UR50D"  # 650M model, dim=1280
+        output_dir="../dataset/esm2_embeddings_35M",
+        model_name="facebook/esm2_t12_35M_UR50D"  # 35M model, dim=320
     )

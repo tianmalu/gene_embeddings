@@ -130,12 +130,19 @@ def generate_enformer_embeddings(gene2tss: dict, genes: list, genome: Fasta, out
         input_tensor = torch.from_numpy(one_hot).unsqueeze(0).to(device)
 
         with torch.no_grad():
-            output = model(input_tensor)
-
-            human_preds = output['human'][0].cpu().numpy()
+            # Use return_embeddings=True to get the actual embeddings
+            # Returns tuple: (predictions_dict, embeddings)
+            output = model(input_tensor, return_embeddings=True)
+            
+            # output is a tuple: (predictions, embeddings)
+            # embeddings shape: (batch, 896, 3072) - 896 bins x 3072 embedding dim
+            embeddings = output[1].cpu().numpy()[0]  # (896, 3072)
+            
+            # Mean pooling across sequence bins to get (3072,) embedding
+            gene_embedding = embeddings.mean(axis=0)  # (3072,)
 
         save_path = os.path.join(out_dir, f"{gene}.npy")
-        np.save(save_path, human_preds.astype(np.float16))
+        np.save(save_path, gene_embedding.astype(np.float16))
 
         count += 1
         if count % 10 == 0:

@@ -16,15 +16,26 @@ from sklearn.model_selection import train_test_split
 from sklearn.metrics import average_precision_score
 from transformers import AutoTokenizer, AutoModel
 import mygene
+import matplotlib.pyplot as plt
+from model import HPOClassifier
+# ============== Set Seed ==============
+import random
+SEED = 42
+torch.manual_seed(SEED)
+np.random.seed(SEED)
+random.seed(SEED)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed_all(SEED)
 
 # ============== Hyperparameters ==============
-HIDDEN_DIM = 512
-BATCH_SIZE = 8  # Smaller batch size due to ESM2 memory requirements
-EPOCHS = 50
+HIDDEN_DIM = 1000
+BATCH_SIZE = 8  # Smaller batch size for fine-tuning ESM2 (reduce if OOM)
+GRAD_ACCUM_STEPS = 4  # Gradient accumulation to simulate larger batch
+EPOCHS = 100
 LEARNING_RATE = 1e-4  # Lower LR for fine-tuning
 ESM2_LR = 1e-6  # Even lower LR for ESM2 backbone
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-MAX_SEQ_LEN = 1024
+MAX_SEQ_LEN = 512  # Reduced from 1024 to save memory during fine-tuning
 FREEZE_ESM2_EPOCHS = 2  # Freeze ESM2 for first N epochs
 
 # ============== Model Definition ==============
@@ -60,14 +71,10 @@ class ESM2OmicsHPOClassifier(nn.Module):
             raise ValueError(f"Unknown fusion_mode: {fusion_mode}")
         
         # Downstream classifier
-        self.classifier = nn.Sequential(
-            nn.Linear(classifier_input_dim, hidden_size),
-            nn.ReLU(),
-            nn.Dropout(0.1),
-            nn.Linear(hidden_size, hidden_size // 2),
-            nn.ReLU(),
-            nn.Dropout(0.1),
-            nn.Linear(hidden_size // 2, num_hpo_classes)
+        self.classifier = HPOClassifier(
+            input_size=classifier_input_dim,
+            hidden_size=hidden_size,
+            out_size=num_hpo_classes
         )
         
         print(f"Model: ESM2 dim={self.esm2_dim}, Omics dim={omics_dim}, "
@@ -83,7 +90,9 @@ class ESM2OmicsHPOClassifier(nn.Module):
         """Unfreeze ESM2 parameters for fine-tuning"""
         for param in self.esm2.parameters():
             param.requires_grad = True
-        print("ESM2 parameters unfrozen for fine-tuning")
+        # Enable gradient checkpointing to reduce memory usage
+        self.esm2.gradient_checkpointing_enable()
+        print("ESM2 parameters unfrozen for fine-tuning (gradient checkpointing enabled)")
     
     def forward(self, input_ids, attention_mask, omics_emb):
         """
@@ -353,10 +362,11 @@ def plot_per_class_auprc_boxplot(y_true, y_pred, save_path='auprc_boxplot_finetu
     return all_auprcs
 
 
-def train_one_epoch(model, dataloader, criterion, optimizer, device):
-    """Train for one epoch"""
+def train_one_epoch(model, dataloader, criterion, optimizer, device, grad_accum_steps=1):
+    """Train for one epoch with gradient accumulation"""
     model.train()
     total_loss = 0.0
+    optimizer.zero_grad()
     
     for batch_idx, (input_ids, attention_mask, omics_emb, labels) in enumerate(dataloader):
         input_ids = input_ids.to(device)
@@ -364,19 +374,24 @@ def train_one_epoch(model, dataloader, criterion, optimizer, device):
         omics_emb = omics_emb.to(device)
         labels = labels.to(device)
         
-        optimizer.zero_grad()
         outputs = model(input_ids, attention_mask, omics_emb)
         loss = criterion(outputs, labels)
+        loss = loss / grad_accum_steps  # Scale loss for gradient accumulation
         loss.backward()
         
-        # Gradient clipping for stability
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        if (batch_idx + 1) % grad_accum_steps == 0 or (batch_idx + 1) == len(dataloader):
+            # Gradient clipping for stability
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
+            optimizer.zero_grad()
+            # Clear cache to free memory
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
         
-        optimizer.step()
-        total_loss += loss.item()
+        total_loss += loss.item() * grad_accum_steps  # Unscale for logging
         
         if batch_idx % 50 == 0:
-            print(f"  Batch {batch_idx}/{len(dataloader)}, Loss: {loss.item():.4f}")
+            print(f"  Batch {batch_idx}/{len(dataloader)}, Loss: {loss.item() * grad_accum_steps:.4f}")
     
     return total_loss / len(dataloader)
 
@@ -418,7 +433,7 @@ if __name__ == "__main__":
         hidden_size=HIDDEN_DIM,
         esm2_model_name="facebook/esm2_t6_8M_UR50D",
         freeze_esm2=True,  # Start frozen
-        fusion_mode="concat"  # or "add"
+        fusion_mode="add"  # or "add"
     )
     model.to(DEVICE)
     print(f"\nModel created. ESM2 dim: {model.esm2_dim}, Omics dim: {omics_dim}, HPO classes: {num_hpo}")
@@ -438,6 +453,8 @@ if __name__ == "__main__":
     print("Starting Training (ESM2 + Omics -> HPO)")
     print("="*50)
     
+    losses = []  # 用于保存每个epoch的train loss
+    val_losses = []  # 用于保存每个epoch的val loss
     for epoch in range(EPOCHS):
         # Unfreeze ESM2 after warm-up epochs
         if epoch == FREEZE_ESM2_EPOCHS:
@@ -447,19 +464,30 @@ if __name__ == "__main__":
         print(f"\nEpoch {epoch+1}/{EPOCHS}")
         
         # Train
-        train_loss = train_one_epoch(model, train_loader, criterion, optimizer, DEVICE)
-        
+        train_loss = train_one_epoch(model, train_loader, criterion, optimizer, DEVICE, GRAD_ACCUM_STEPS)
+        losses.append(train_loss)
         # Evaluate
         val_loss, val_auprc = evaluate(model, val_loader, criterion, DEVICE)
-        
+        val_losses.append(val_loss)
         print(f"  Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f} | Val AUPRC: {val_auprc:.4f}")
-        
         # Save best model
         if val_auprc > best_val_auprc:
             best_val_auprc = val_auprc
             torch.save(model.state_dict(), "best_esm2_omics_hpo_finetuned.pth")
             print(f"  -> New best model saved! AUPRC: {val_auprc:.4f}")
-    
+
+    plt.figure()
+    plt.plot(range(1, EPOCHS+1), losses, marker='o', label='Train Loss')
+    plt.plot(range(1, EPOCHS+1), val_losses, marker='s', label='Val Loss')
+    plt.xlabel('Epoch')
+    plt.ylabel('Loss')
+    plt.title('Training & Validation Loss Curve')
+    plt.legend()
+    plt.grid(True)
+    plt.savefig('loss_plot_esm2_omics_finetune.png', dpi=300)
+    plt.show()
+    print("Loss plot saved to: loss_plot_esm2_omics_finetune.png")
+
     # Final evaluation
     print("\n" + "="*50)
     print("Final Test Evaluation")
