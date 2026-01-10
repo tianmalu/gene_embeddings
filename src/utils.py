@@ -5,9 +5,9 @@ import mygene
 import os
 
 # ---------- 1. Read Omics embedding ----------
-def load_omics_embedding():
-    data_path = "../dataset/"
-    omic_path = "omics_embeddings"
+def load_omics_embedding(dataset_path="/p/scratch/hai_1134/reimt/dataset"):
+    data_path = dataset_path
+    omic_path = "/omics_embeddings"
     emb_path = data_path + omic_path + "/Supplementary_Table_S3_OMICS_EMB.tsv"
 
     df_emb = pd.read_csv(emb_path, sep="\t")
@@ -83,8 +83,8 @@ def map_ensembl_to_symbol(df_emb):
     return df_emb
 
 # ---------------- 3. Read HPO gene labels ----------------
-def load_hpo_labels():
-    hpo_path = "../dataset/genes_to_phenotype.txt"  
+def load_hpo_labels(dataset_path=None):
+    hpo_path = f"{dataset_path}/genes_to_phenotype.txt"  
 
     df_hpo = pd.read_csv(hpo_path, sep="\t", comment="#")
     print("HPO columns:", df_hpo.columns)
