@@ -4,15 +4,17 @@ from torch.utils.data import DataLoader
 import torch.nn.functional as F
 
 class HPOClassifier(nn.Module):
-    def __init__(self, input_size, hidden_size, out_size, dropout_prob=0.2):
+    def __init__(self, input_dim, output_dim, hidden_dim=1000, dropout=0.3):
         super().__init__()
-        
-        self.l1 = nn.Linear(input_size, hidden_size)
-        self.dropout = nn.Dropout(p=dropout_prob) 
-        self.l2 = nn.Linear(hidden_size, out_size)
-    
-    def forward(self, x):
-        out = F.relu(self.l1(x))
-        out = self.dropout(out)
-        out = self.l2(out)
-        return out
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.BatchNorm1d(hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.BatchNorm1d(hidden_dim // 2),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim // 2, output_dim)
+        )
+    def forward(self, x): return self.net(x)

@@ -2,13 +2,13 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, Dataset
 import numpy as np
-from utils import split_data, plot_training_curves, plot_roc_curves, plot_prediction_distribution, plot_top_k_accuracy, plot_per_class_performance
+from utils import load_fixed_split_data, plot_training_curves, plot_roc_curves, plot_prediction_distribution, plot_top_k_accuracy, plot_per_class_performance
 from model import HPOClassifier
 from sklearn.metrics import roc_auc_score, average_precision_score
 
 HIDDEN_DIM = 1000
-BATCH_SIZE = 64
-EPOCHS = 100
+BATCH_SIZE = 128
+EPOCHS = 35
 LEARNING_RATE = 0.0001
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -64,7 +64,13 @@ class GeneHPODataset(Dataset):
 
 
 if __name__ == "__main__":
-    X_train, Y_train, X_val, Y_val, X_test, Y_test = split_data(use_esm2=True, fusion_mode="concat", esm2_model="8M")
+    # Load data from fixed train/val/test splits (TSV files)
+    X_train, Y_train, X_val, Y_val, X_test, Y_test, hpo2idx = load_fixed_split_data(
+        dataset_path="../dataset",
+        use_esm2=True, 
+        fusion_mode="add", 
+        esm2_model="650M"
+    )
 
 
     train_dataset = GeneHPODataset(X_train, Y_train)
@@ -78,12 +84,16 @@ if __name__ == "__main__":
     print(f"\nDataLoader Batches: Train={len(train_loader)}, Val={len(val_loader)}, Test={len(test_loader)}")
 
     in_dim = X_train.shape[1]
-    out_dim = Y_train.shape[1]
+    out_dim = Y_train.shape[1]  # This is already all HPO terms from the dataset
+    
+    print(f"\nInput dimension: {in_dim}")
+    print(f"Output dimension (total HPO terms): {out_dim}")
+    print(f"Total unique HPO terms in hpo2idx: {len(hpo2idx)}")
     
     model = HPOClassifier(
-        input_size=in_dim, 
-        hidden_size=HIDDEN_DIM, 
-        out_size=out_dim
+        input_dim=in_dim, 
+        output_dim=out_dim,
+        hidden_dim=HIDDEN_DIM
     )
     model.to(DEVICE) 
     print("\nModel Architecture:\n", model)

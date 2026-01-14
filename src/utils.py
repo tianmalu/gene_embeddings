@@ -208,6 +208,163 @@ def split_data(use_esm2=True, fusion_mode="concat", esm2_model="8M"):
     print("train:", X_train.shape, "val:", X_val.shape, "test:", X_test.shape)
     return X_train, Y_train, X_val, Y_val, X_test, Y_test
 
+# ---------------- 6.5 Load fixed train/val/test splits from TSV files ----------------
+def load_fixed_split_data(dataset_path="../dataset", use_esm2=True, fusion_mode="concat", esm2_model="8M", use_cache=True):
+    """
+    Load embeddings and split data using fixed train/val/test splits from TSV files.
+    
+    Args:
+        dataset_path: Path to the dataset directory containing the TSV files.
+        use_esm2: If True, combine ESM2 embeddings with omics embeddings.
+        fusion_mode: How to combine omics and ESM2 embeddings. Options:
+                     - "concat": Concatenate embeddings (default)
+                     - "add": Element-wise addition (with padding if dims differ)
+        esm2_model: Which ESM2 model embeddings to use. Options:
+                    - "8M": esm2_t6_8M_UR50D (dim=320)
+                    - "650M": esm2_t33_650M_UR50D (dim=1280)
+        use_cache: If True, use cached Ensembl->Symbol mapping to speed up loading.
+    """
+    import mygene
+    import pickle
+    
+    # 1. Load fixed gene splits from TSV files
+    train_df = pd.read_csv(f"{dataset_path}/train_genes.tsv", sep="\t")
+    val_df = pd.read_csv(f"{dataset_path}/validation_genes.tsv", sep="\t")
+    test_df = pd.read_csv(f"{dataset_path}/test_genes.tsv", sep="\t")
+    
+    train_ensg = train_df.iloc[:, 0].tolist()
+    val_ensg = val_df.iloc[:, 0].tolist()
+    test_ensg = test_df.iloc[:, 0].tolist()
+    
+    print(f"Fixed splits loaded: Train={len(train_ensg)}, Val={len(val_ensg)}, Test={len(test_ensg)}")
+    
+    # 2. Map Ensembl IDs to gene symbols (with caching)
+    all_ensg = train_ensg + val_ensg + test_ensg
+    cache_file = f"{dataset_path}/ensg2symbol_cache.pkl"
+    
+    ensg2symbol = {}
+    if use_cache and os.path.exists(cache_file):
+        print(f"Loading cached Ensembl->Symbol mapping from {cache_file}...")
+        with open(cache_file, 'rb') as f:
+            ensg2symbol = pickle.load(f)
+        print(f"Loaded {len(ensg2symbol)} cached mappings")
+    else:
+        print("Querying mygene for gene symbols (this may take a while)...")
+        mg = mygene.MyGeneInfo()
+        out = mg.querymany(
+            all_ensg,
+            scopes="ensembl.gene",
+            fields="symbol",
+            species="human",
+            as_dataframe=True,
+            verbose=False
+        )
+        if 'symbol' in out.columns:
+            ensg2symbol = out["symbol"].dropna().to_dict()
+        
+        # Save to cache
+        if use_cache:
+            print(f"Saving mapping to cache: {cache_file}")
+            with open(cache_file, 'wb') as f:
+                pickle.dump(ensg2symbol, f)
+    
+    print(f"Successfully mapped {len(ensg2symbol)} out of {len(all_ensg)} genes")
+    
+    # Convert Ensembl IDs to symbols
+    train_symbols = [ensg2symbol.get(e) for e in train_ensg if e in ensg2symbol]
+    val_symbols = [ensg2symbol.get(e) for e in val_ensg if e in ensg2symbol]
+    test_symbols = [ensg2symbol.get(e) for e in test_ensg if e in ensg2symbol]
+    
+    print(f"After symbol mapping: Train={len(train_symbols)}, Val={len(val_symbols)}, Test={len(test_symbols)}")
+    
+    # 3. Load omics embeddings
+    df_emb = load_omics_embedding(dataset_path)
+    df_emb = map_ensembl_to_symbol(df_emb)
+    
+    # 4. Load HPO labels
+    gene2hpos = load_hpo_labels(dataset_path)
+    
+    # 5. Load ESM2 embeddings if requested
+    gene2esm2 = None
+    if use_esm2:
+        gene2esm2 = load_esm2_embeddings(esm2_model=esm2_model)
+    
+    # 6. Determine which genes have all required data
+    available_genes = set(df_emb.index) & set(gene2hpos.index)
+    if gene2esm2 is not None:
+        available_genes = available_genes & set(gene2esm2.keys())
+    
+    # Filter genes to only include those with all required data
+    train_genes = [g for g in train_symbols if g in available_genes]
+    val_genes = [g for g in val_symbols if g in available_genes]
+    test_genes = [g for g in test_symbols if g in available_genes]
+    
+    print(f"After filtering for available data: Train={len(train_genes)}, Val={len(val_genes)}, Test={len(test_genes)}")
+    
+    # 7. Build HPO index using ALL HPO terms from the entire dataset (not just train/val/test)
+    # This ensures consistent label space across all genes
+    print("Building HPO index from entire genes_to_phenotype.txt file...")
+    df_hpo_full = pd.read_csv(f"{dataset_path}/genes_to_phenotype.txt", sep="\t", comment="#")
+    all_hpo_terms = sorted(df_hpo_full["hpo_id"].dropna().unique())
+    hpo2idx = {h: i for i, h in enumerate(all_hpo_terms)}
+    num_hpo = len(hpo2idx)
+    print(f"Total HPO terms in dataset: {num_hpo}")
+    
+    # Count how many appear in our train/val/test splits
+    split_hpo_terms = {h for g in (train_genes + val_genes + test_genes) for h in gene2hpos[g]}
+    print(f"HPO terms appearing in train/val/test splits: {len(split_hpo_terms)}")
+    print(f"Coverage: {len(split_hpo_terms)/num_hpo*100:.1f}%")
+    
+    # 8. Helper function to build X, Y matrices
+    def build_XY(genes):
+        X_list, Y_list = [], []
+        for g in genes:
+            # Get omics embedding
+            x_omics = df_emb.loc[g].values.astype(np.float32)
+            
+            # Combine with ESM2 embedding if available
+            if use_esm2 and gene2esm2 is not None:
+                x_esm2 = gene2esm2[g].astype(np.float32)
+                
+                if fusion_mode == "concat":
+                    x = np.concatenate([x_omics, x_esm2])
+                elif fusion_mode == "add":
+                    max_dim = max(len(x_omics), len(x_esm2))
+                    x_omics_padded = np.pad(x_omics, (0, max_dim - len(x_omics)), mode='constant')
+                    x_esm2_padded = np.pad(x_esm2, (0, max_dim - len(x_esm2)), mode='constant')
+                    x = x_omics_padded + x_esm2_padded
+                else:
+                    raise ValueError(f"Unknown fusion_mode: {fusion_mode}. Use 'concat' or 'add'.")
+            else:
+                x = x_omics
+            
+            y = np.zeros(num_hpo, dtype=np.float32)
+            for h in gene2hpos[g]:
+                if h in hpo2idx:
+                    y[hpo2idx[h]] = 1.0
+            
+            X_list.append(x)
+            Y_list.append(y)
+        
+        return np.stack(X_list), np.stack(Y_list)
+    
+    # Build datasets
+    X_train, Y_train = build_XY(train_genes)
+    X_val, Y_val = build_XY(val_genes)
+    X_test, Y_test = build_XY(test_genes)
+    
+    print(f"X_train: {X_train.shape}, Y_train: {Y_train.shape}")
+    print(f"X_val: {X_val.shape}, Y_val: {Y_val.shape}")
+    print(f"X_test: {X_test.shape}, Y_test: {Y_test.shape}")
+    
+    if use_esm2:
+        if fusion_mode == "concat":
+            print(f"  -> Omics dim + ESM2 dim = {X_train.shape[1]} (concatenated)")
+        else:
+            print(f"  -> Output dim = {X_train.shape[1]} (element-wise add)")
+    
+    return X_train, Y_train, X_val, Y_val, X_test, Y_test, hpo2idx
+
 # ---------------- 7. Visualization functions ----------------
 import matplotlib.pyplot as plt
 import seaborn as sns
@@ -366,9 +523,64 @@ def plot_per_class_performance(y_true, y_pred, top_n=20, save_path='per_class_pe
                   f'N Classes: {len(all_auprcs)}')
     ax.text(1.15, 0.5, stats_text, transform=ax.transAxes, fontsize=10,
             verticalalignment='center', bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
-    
+    plt.yscale('log')
+
     plt.tight_layout()
     plt.savefig(save_path, dpi=300, bbox_inches='tight')
     plt.close()
     print(f"AUPRC box plot saved to: {save_path}")
+
+
+def plot_cv_boxplot(results_dict, experiment_name, save_path):
+    """
+    Plots the distribution of AUPRC scores across all HPO terms.
+    results_dict values are lists of arrays (e.g., [fold1_scores_array, fold2_scores_array]).
+    """
+    data = []
+    model_means = {}
+
+    for model_name, folds_scores in results_dict.items():
+        # Flatten the list of arrays into a single list of all term scores across all folds
+        if isinstance(folds_scores, list):
+            # folds_scores is [array([0.5, 0.6...]), array([0.4, ...])]
+            all_scores = np.concatenate(folds_scores) if len(folds_scores) > 0 else np.array([])
+        else:
+            all_scores = np.array(folds_scores)
+
+        if len(all_scores) == 0: continue
+
+        # Store for plotting
+        for score in all_scores:
+            data.append({'Model': model_name, 'AUPRC': score})
+
+        # Calculate Mean AUPRC
+        model_means[model_name] = np.mean(all_scores)
+
+    if not data:
+        print("!! Warning: No data to plot.")
+        return
+
+    df_plot = pd.DataFrame(data)
+
+    plt.figure(figsize=(10, 6))
+
+    # Create Boxplot
+    # showmeans=True adds a marker for the mean (distinct from the median line)
+    ax = sns.boxplot(x='Model', y='AUPRC', data=df_plot, width=0.5, palette="Set2",
+                     showmeans=True,
+                     meanprops={"marker":"^", "markerfacecolor":"white", "markeredgecolor":"black", "markersize":"10"})
+
+    plt.yscale('log')
+    # Update X-axis labels to include the Mean AUPRC value
+    current_labels = [label.get_text() for label in ax.get_xticklabels()]
+    new_labels = [f"{name}\nMean: {model_means.get(name, 0):.3f}" for name in current_labels]
+    ax.set_xticklabels(new_labels)
+
+    plt.title(f'Distribution of Per-Term AUPRC: {experiment_name}')
+    plt.ylabel('AUPRC (Per HPO Term)')
+    plt.grid(axis='y', which='both', linestyle='--', alpha=0.5)
+    plt.tight_layout()
+    plt.savefig(save_path)
+    print(f"Plot saved to: {save_path}")
+    plt.close()
 
