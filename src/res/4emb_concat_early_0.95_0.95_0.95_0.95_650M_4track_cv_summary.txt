@@ -1,0 +1,24 @@
+5-Fold Cross-Validation Summary
+======================================================================
+
+Configuration:
+  Fusion mode: concat
+  PCA mode: early_pca
+  ESM2 model: 650M
+  Orthrus track: 4track
+  Epochs: 50
+  Learning rate: 0.0001
+  Batch size: 32
+  Hidden dim: 1000
+
+Results per fold:
+  Fold 1: Val AUPRC = 0.1724, Train samples = 4041, Val samples = 1011, Labels = 9706
+  Fold 2: Val AUPRC = 0.1522, Train samples = 4041, Val samples = 1011, Labels = 9736
+  Fold 3: Val AUPRC = 0.1441, Train samples = 4042, Val samples = 1010, Labels = 9755
+  Fold 4: Val AUPRC = 0.1528, Train samples = 4042, Val samples = 1010, Labels = 9683
+  Fold 5: Val AUPRC = 0.1558, Train samples = 4042, Val samples = 1010, Labels = 9721
+
+Overall Performance:
+  Mean Val AUPRC: 0.1555 ± 0.0093
+  Min Val AUPRC: 0.1441
+  Max Val AUPRC: 0.1724

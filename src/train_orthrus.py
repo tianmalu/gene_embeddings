@@ -4,6 +4,7 @@ Train HPO Classifier with 2 Embeddings: Omics + Orthrus
 Supports:
 - Fusion modes: 'add' or 'concat'
 - Orthrus track types: '4track' or '6track'
+- 5-Fold Cross Validation
 - Results saved to res/ folder
 """
 
@@ -14,7 +15,7 @@ import numpy as np
 import os
 import pandas as pd
 import pickle
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import KFold
 from sklearn.metrics import average_precision_score
 import mygene
 
@@ -24,8 +25,9 @@ from utils import plot_training_curves, plot_roc_curves, plot_prediction_distrib
 # ==================== Configuration ====================
 HIDDEN_DIM = 1000
 BATCH_SIZE = 32
-EPOCHS = 100
+EPOCHS = 70
 LEARNING_RATE = 0.0001
+N_FOLDS = 5
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # Set random seed
@@ -112,14 +114,15 @@ def load_hpo_labels():
 
 def prepare_data_orthrus_omics(orthrus_track="4track", fusion_mode="concat"):
     """
-    Load Omics + Orthrus embeddings and prepare data for training.
+    Load Omics + Orthrus embeddings and prepare data for 5-fold CV.
     
     Args:
         orthrus_track: Orthrus track type ('4track' or '6track')
         fusion_mode: 'add' or 'concat'
     
     Returns:
-        X_train, Y_train, X_val, Y_val, X_test, Y_test
+        X: Fused embeddings (N, dim)
+        Y: HPO labels (N, num_hpo)
     """
     print("=" * 70)
     print("Loading 2 Embeddings: Omics + Orthrus")
@@ -166,12 +169,10 @@ def prepare_data_orthrus_omics(orthrus_track="4track", fusion_mode="concat"):
         max_dim = max(omics_dim, orthrus_dim)
         print(f"\nFusion mode: ADD (element-wise)")
         print(f"  Max dim = {max_dim}")
-        output_dim = max_dim
     else:  # concat
         concat_dim = omics_dim + orthrus_dim
         print(f"\nFusion mode: CONCAT")
         print(f"  Concat dim = {omics_dim} + {orthrus_dim} = {concat_dim}")
-        output_dim = concat_dim
     
     print(f"\nCollecting embeddings for {N} genes...")
     
@@ -192,52 +193,31 @@ def prepare_data_orthrus_omics(orthrus_track="4track", fusion_mode="concat"):
     
     print(f"  Done! Collected all embeddings.")
     
-    # ==================== Train/Val/Test Split ====================
-    print("\nSplitting data (70/15/15)...")
-    indices = np.arange(N)
-    idx_train, idx_tmp = train_test_split(indices, test_size=0.3, random_state=SEED)
-    idx_val, idx_test = train_test_split(idx_tmp, test_size=0.5, random_state=SEED)
-    
-    print(f"Split sizes: Train={len(idx_train)}, Val={len(idx_val)}, Test={len(idx_test)}")
-    
-    # Split each embedding
-    X_omics_train, X_omics_val, X_omics_test = X_omics[idx_train], X_omics[idx_val], X_omics[idx_test]
-    X_orthrus_train, X_orthrus_val, X_orthrus_test = X_orthrus[idx_train], X_orthrus[idx_val], X_orthrus[idx_test]
-    Y_train, Y_val, Y_test = Y[idx_train], Y[idx_val], Y[idx_test]
-    
     # ==================== Fusion ====================
     if fusion_mode == "add":
         print("\n" + "=" * 70)
         print("Applying ADD Fusion (with padding)")
         print("=" * 70)
         
-        def pad_and_add(arr1, arr2, max_dim):
-            result = np.zeros((arr1.shape[0], max_dim), dtype=np.float32)
-            padded1 = np.pad(arr1, ((0, 0), (0, max_dim - arr1.shape[1])), mode='constant')
-            padded2 = np.pad(arr2, ((0, 0), (0, max_dim - arr2.shape[1])), mode='constant')
-            result = padded1 + padded2
-            return result
+        max_dim = max(omics_dim, orthrus_dim)
+        padded_omics = np.pad(X_omics, ((0, 0), (0, max_dim - omics_dim)), mode='constant')
+        padded_orthrus = np.pad(X_orthrus, ((0, 0), (0, max_dim - orthrus_dim)), mode='constant')
+        X = (padded_omics + padded_orthrus).astype(np.float32)
         
-        X_train = pad_and_add(X_omics_train, X_orthrus_train, max_dim)
-        X_val = pad_and_add(X_omics_val, X_orthrus_val, max_dim)
-        X_test = pad_and_add(X_omics_test, X_orthrus_test, max_dim)
-        
-        print(f"Final dimension: {X_train.shape[1]}")
+        print(f"Final dimension: {X.shape[1]}")
         
     else:  # concat
         print("\n" + "=" * 70)
         print("Applying CONCAT")
         print("=" * 70)
         
-        X_train = np.concatenate([X_omics_train, X_orthrus_train], axis=1)
-        X_val = np.concatenate([X_omics_val, X_orthrus_val], axis=1)
-        X_test = np.concatenate([X_omics_test, X_orthrus_test], axis=1)
+        X = np.concatenate([X_omics, X_orthrus], axis=1).astype(np.float32)
         
-        print(f"Final dimension: {X_train.shape[1]}")
+        print(f"Final dimension: {X.shape[1]}")
     
-    print(f"\nFinal data shapes: X_train={X_train.shape}, Y_train={Y_train.shape}")
+    print(f"\nFinal data shapes: X={X.shape}, Y={Y.shape}")
     
-    return X_train.astype(np.float32), Y_train, X_val.astype(np.float32), Y_val, X_test.astype(np.float32), Y_test
+    return X, Y
 
 
 # ==================== Dataset Class ====================
@@ -287,16 +267,67 @@ def evaluate(model, data_loader, criterion, device):
     return avg_loss, auprc, all_outputs, all_targets
 
 
+# ==================== Training Function for One Fold ====================
+
+def train_one_fold(model, train_loader, val_loader, criterion, optimizer, 
+                   epochs, device, model_save_path):
+    """Train model for one fold and return best val AUPRC."""
+    best_val_auprc = 0.0
+    train_losses = []
+    val_losses = []
+    train_auprcs = []
+    val_auprcs = []
+    
+    for epoch in range(epochs):
+        model.train()
+        total_loss = 0.0
+        
+        for X_batch, Y_batch in train_loader:
+            X_batch, Y_batch = X_batch.to(device), Y_batch.to(device)
+            
+            optimizer.zero_grad()
+            outputs = model(X_batch)
+            loss = criterion(outputs, Y_batch)
+            total_loss += loss.item()
+            
+            loss.backward()
+            optimizer.step()
+        
+        # Evaluate
+        train_loss, train_auprc, _, _ = evaluate(model, train_loader, criterion, device)
+        val_loss, val_auprc, _, _ = evaluate(model, val_loader, criterion, device)
+        
+        train_losses.append(train_loss)
+        val_losses.append(val_loss)
+        train_auprcs.append(train_auprc)
+        val_auprcs.append(val_auprc)
+        
+        print(f"  Epoch {epoch+1}/{epochs}: "
+              f"Train Loss: {train_loss:.4f} | "
+              f"Train AUPRC: {train_auprc:.4f} | "
+              f"Val Loss: {val_loss:.4f} | "
+              f"Val AUPRC: {val_auprc:.4f}")
+        
+        # Save best model
+        if val_auprc > best_val_auprc:
+            best_val_auprc = val_auprc
+            torch.save(model.state_dict(), model_save_path)
+    
+    return best_val_auprc, train_losses, val_losses, train_auprcs, val_auprcs
+
+
 # ==================== Main Training Script ====================
 
 if __name__ == "__main__":
     import argparse
     
-    parser = argparse.ArgumentParser(description='Train HPO classifier with Omics + Orthrus embeddings')
+    parser = argparse.ArgumentParser(description='Train HPO classifier with Omics + Orthrus embeddings (5-Fold CV)')
     parser.add_argument('--fusion_mode', type=str, default='concat', choices=['concat', 'add'],
                         help='Fusion mode (default: concat)')
     parser.add_argument('--orthrus_track', type=str, default='4track', choices=['4track', '6track'],
                         help='Orthrus track type (default: 4track)')
+    parser.add_argument('--n_folds', type=int, default=N_FOLDS,
+                        help=f'Number of folds (default: {N_FOLDS})')
     parser.add_argument('--epochs', type=int, default=EPOCHS,
                         help=f'Number of epochs (default: {EPOCHS})')
     parser.add_argument('--lr', type=float, default=LEARNING_RATE,
@@ -309,11 +340,12 @@ if __name__ == "__main__":
     args = parser.parse_args()
     
     print("\n" + "=" * 70)
-    print("Training HPO Classifier with 2 Embeddings")
+    print("Training HPO Classifier with 2 Embeddings (5-Fold CV)")
     print("Omics + Orthrus")
     print("=" * 70)
     print(f"Fusion Mode: {args.fusion_mode}")
     print(f"Orthrus Track: {args.orthrus_track}")
+    print(f"Number of Folds: {args.n_folds}")
     print(f"Epochs: {args.epochs}")
     print(f"Learning Rate: {args.lr}")
     print(f"Batch Size: {args.batch_size}")
@@ -326,121 +358,149 @@ if __name__ == "__main__":
     os.makedirs(res_dir, exist_ok=True)
     
     # Load and prepare data
-    X_train, Y_train, X_val, Y_val, X_test, Y_test = prepare_data_orthrus_omics(
+    X, Y = prepare_data_orthrus_omics(
         orthrus_track=args.orthrus_track,
         fusion_mode=args.fusion_mode
     )
     
-    # Create datasets and dataloaders
-    train_dataset = GeneHPODataset(X_train, Y_train)
-    val_dataset = GeneHPODataset(X_val, Y_val)
-    test_dataset = GeneHPODataset(X_test, Y_test)
-    
-    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True)
-    val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False)
-    test_loader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False)
-    
-    print(f"\nDataLoader Batches: Train={len(train_loader)}, Val={len(val_loader)}, Test={len(test_loader)}")
-    
-    # Initialize model
-    in_dim = X_train.shape[1]
-    out_dim = Y_train.shape[1]
-    
-    model = HPOClassifier(
-        input_size=in_dim,
-        hidden_size=args.hidden_dim,
-        out_size=out_dim
-    )
-    model.to(DEVICE)
-    print("\nModel Architecture:\n", model)
-    print(f"Input dim: {in_dim}, Hidden dim: {args.hidden_dim}, Output dim: {out_dim}")
-    
-    # Loss and optimizer
-    criterion = nn.BCEWithLogitsLoss()
-    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
-    
-    # Training loop
-    print("\nStarting Training...")
-    best_val_auprc = 0.0
-    
-    train_losses = []
-    val_losses = []
-    train_auprcs = []
-    val_auprcs = []
-    
-    # Model save path
-    prefix = f"orthrus_omics_{args.fusion_mode}_{args.orthrus_track}"
-    model_save_path = os.path.join(res_dir, f'best_{prefix}.pth')
-    
-    for epoch in range(args.epochs):
-        model.train()
-        total_loss = 0.0
-        
-        for X_batch, Y_batch in train_loader:
-            X_batch, Y_batch = X_batch.to(DEVICE), Y_batch.to(DEVICE)
-            
-            optimizer.zero_grad()
-            outputs = model(X_batch)
-            loss = criterion(outputs, Y_batch)
-            total_loss += loss.item()
-            
-            loss.backward()
-            optimizer.step()
-        
-        # Evaluate
-        train_loss, train_auprc, _, _ = evaluate(model, train_loader, criterion, DEVICE)
-        val_loss, val_auprc, _, _ = evaluate(model, val_loader, criterion, DEVICE)
-        
-        train_losses.append(train_loss)
-        val_losses.append(val_loss)
-        train_auprcs.append(train_auprc)
-        val_auprcs.append(val_auprc)
-        
-        print(f"Epoch {epoch+1}/{args.epochs}: "
-              f"Train Loss: {train_loss:.4f} | "
-              f"Train AUPRC: {train_auprc:.4f} | "
-              f"Val Loss: {val_loss:.4f} | "
-              f"Val AUPRC: {val_auprc:.4f}")
-        
-        # Save best model
-        if val_auprc > best_val_auprc:
-            best_val_auprc = val_auprc
-            torch.save(model.state_dict(), model_save_path)
-            print(f"  -> New best model saved! Val AUPRC: {val_auprc:.4f}")
-    
-    # Final test evaluation
+    # ==================== 5-Fold Cross Validation ====================
     print("\n" + "=" * 70)
-    print("Final Test Evaluation")
+    print(f"Starting {args.n_folds}-Fold Cross Validation")
     print("=" * 70)
-    print(f"Loading best model from: {model_save_path}")
-    model.load_state_dict(torch.load(model_save_path))
     
-    test_loss, test_auprc, test_outputs, test_targets = evaluate(model, test_loader, criterion, DEVICE)
+    kfold = KFold(n_splits=args.n_folds, shuffle=True, random_state=SEED)
+    
+    in_dim = X.shape[1]
+    out_dim = Y.shape[1]
+    
+    fold_results = []
+    all_val_outputs = []
+    all_val_targets = []
+    
+    prefix = f"orthrus_omics_{args.fusion_mode}_{args.orthrus_track}"
+    
+    for fold, (train_idx, val_idx) in enumerate(kfold.split(X)):
+        print(f"\n{'='*70}")
+        print(f"Fold {fold + 1}/{args.n_folds}")
+        print(f"{'='*70}")
+        print(f"Train samples: {len(train_idx)}, Val samples: {len(val_idx)}")
+        
+        # Split data
+        X_train, X_val = X[train_idx], X[val_idx]
+        Y_train, Y_val = Y[train_idx], Y[val_idx]
+        
+        # Create datasets and dataloaders
+        train_dataset = GeneHPODataset(X_train, Y_train)
+        val_dataset = GeneHPODataset(X_val, Y_val)
+        
+        train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True)
+        val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False)
+        
+        # Initialize model
+        model = HPOClassifier(
+            input_size=in_dim,
+            hidden_size=args.hidden_dim,
+            out_size=out_dim
+        )
+        model.to(DEVICE)
+        
+        if fold == 0:
+            print("\nModel Architecture:\n", model)
+            print(f"Input dim: {in_dim}, Hidden dim: {args.hidden_dim}, Output dim: {out_dim}")
+        
+        # Loss and optimizer
+        criterion = nn.BCEWithLogitsLoss()
+        optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
+        
+        # Model save path for this fold
+        model_save_path = os.path.join(res_dir, f'best_{prefix}_fold{fold+1}.pth')
+        
+        # Train
+        print(f"\nStarting Training for Fold {fold + 1}...")
+        best_val_auprc, train_losses, val_losses, train_auprcs, val_auprcs = train_one_fold(
+            model, train_loader, val_loader, criterion, optimizer,
+            args.epochs, DEVICE, model_save_path
+        )
+        
+        fold_results.append({
+            'fold': fold + 1,
+            'best_val_auprc': best_val_auprc,
+            'train_losses': train_losses,
+            'val_losses': val_losses,
+            'train_auprcs': train_auprcs,
+            'val_auprcs': val_auprcs
+        })
+        
+        # Load best model and get predictions
+        model.load_state_dict(torch.load(model_save_path))
+        _, _, val_outputs, val_targets = evaluate(model, val_loader, criterion, DEVICE)
+        all_val_outputs.append(val_outputs)
+        all_val_targets.append(val_targets)
+        
+        print(f"\nFold {fold + 1} Best Val AUPRC: {best_val_auprc:.4f}")
+        
+        # Generate fold-specific plots
+        plot_training_curves(train_losses, val_losses, train_auprcs, val_auprcs,
+                            save_path=os.path.join(res_dir, f'{prefix}_fold{fold+1}_training_curves.png'))
+    
+    # ==================== Summary ====================
+    print("\n" + "=" * 70)
+    print("5-Fold Cross Validation Summary")
+    print("=" * 70)
+    
+    auprcs = [r['best_val_auprc'] for r in fold_results]
+    mean_auprc = np.mean(auprcs)
+    std_auprc = np.std(auprcs)
+    
+    for r in fold_results:
+        print(f"Fold {r['fold']}: Best Val AUPRC = {r['best_val_auprc']:.4f}")
     
     print("-" * 50)
-    print(f"Final Test Loss (Best Model): {test_loss:.4f}")
-    print(f"Final Test AUPRC (Best Model): {test_auprc:.4f}")
+    print(f"Mean AUPRC: {mean_auprc:.4f} ± {std_auprc:.4f}")
     print("-" * 50)
     
-    # Generate visualization plots
-    print("\nGenerating visualization plots...")
+    # Concatenate all validation results for overall evaluation
+    all_val_outputs = np.concatenate(all_val_outputs, axis=0)
+    all_val_targets = np.concatenate(all_val_targets, axis=0)
     
-    plot_training_curves(train_losses, val_losses, train_auprcs, val_auprcs,
-                        save_path=os.path.join(res_dir, f'{prefix}_training_curves.png'))
+    overall_auprc = average_precision_score(all_val_targets, all_val_outputs, average='micro')
+    print(f"Overall AUPRC (all folds combined): {overall_auprc:.4f}")
     
-    plot_roc_curves(test_targets, test_outputs, num_classes_to_plot=5,
-                   save_path=os.path.join(res_dir, f'{prefix}_roc_curves.png'))
+    # Generate overall visualization plots
+    print("\nGenerating overall visualization plots...")
     
-    plot_prediction_distribution(test_targets, test_outputs,
-                                save_path=os.path.join(res_dir, f'{prefix}_prediction_distribution.png'))
+    plot_roc_curves(all_val_targets, all_val_outputs, num_classes_to_plot=5,
+                   save_path=os.path.join(res_dir, f'{prefix}_5fold_roc_curves.png'))
     
-    plot_top_k_accuracy(test_targets, test_outputs, k_values=[1, 3, 5, 10, 20, 50],
-                       save_path=os.path.join(res_dir, f'{prefix}_top_k_accuracy.png'))
+    plot_prediction_distribution(all_val_targets, all_val_outputs,
+                                save_path=os.path.join(res_dir, f'{prefix}_5fold_prediction_distribution.png'))
     
-    plot_per_class_performance(test_targets, test_outputs, top_n=20,
-                              save_path=os.path.join(res_dir, f'{prefix}_auprc_boxplot.png'))
+    plot_top_k_accuracy(all_val_targets, all_val_outputs, k_values=[1, 3, 5, 10, 20, 50],
+                       save_path=os.path.join(res_dir, f'{prefix}_5fold_top_k_accuracy.png'))
+    
+    plot_per_class_performance(all_val_targets, all_val_outputs, top_n=20,
+                              save_path=os.path.join(res_dir, f'{prefix}_5fold_auprc_boxplot.png'))
+    
+    # Save summary results
+    summary_path = os.path.join(res_dir, f'{prefix}_5fold_summary.txt')
+    with open(summary_path, 'w') as f:
+        f.write(f"5-Fold Cross Validation Summary\n")
+        f.write(f"{'='*50}\n")
+        f.write(f"Fusion Mode: {args.fusion_mode}\n")
+        f.write(f"Orthrus Track: {args.orthrus_track}\n")
+        f.write(f"Epochs: {args.epochs}\n")
+        f.write(f"Learning Rate: {args.lr}\n")
+        f.write(f"Batch Size: {args.batch_size}\n")
+        f.write(f"Hidden Dim: {args.hidden_dim}\n")
+        f.write(f"{'='*50}\n\n")
+        for r in fold_results:
+            f.write(f"Fold {r['fold']}: Best Val AUPRC = {r['best_val_auprc']:.4f}\n")
+        f.write(f"\n{'='*50}\n")
+        f.write(f"Mean AUPRC: {mean_auprc:.4f} ± {std_auprc:.4f}\n")
+        f.write(f"Overall AUPRC (all folds): {overall_auprc:.4f}\n")
     
     print("\nAll visualization plots have been generated!")
     print(f"\nTraining completed!")
-    print(f"  Best model saved to: {model_save_path}")
+    print(f"  Models saved to: {res_dir}/best_{prefix}_fold*.pth")
+    print(f"  Summary saved to: {summary_path}")
     print(f"  Plots saved to: {res_dir}/")

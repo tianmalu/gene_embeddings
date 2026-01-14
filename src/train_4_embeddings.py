@@ -14,29 +14,31 @@ import numpy as np
 import os
 import pandas as pd
 import pickle
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import train_test_split, KFold
 from sklearn.metrics import average_precision_score
 from sklearn.decomposition import PCA
 import mygene
 import joblib
 import gc
+import matplotlib.pyplot as plt
 
-from model import HPOClassifier
+from model import ImprovedHPOClassifier
 from utils import plot_training_curves, plot_roc_curves, plot_prediction_distribution, plot_top_k_accuracy, plot_per_class_performance
 
 # ==================== Configuration ====================
 HIDDEN_DIM = 1000
 BATCH_SIZE = 32
-EPOCHS = 100
+EPOCHS = 50
 LEARNING_RATE = 0.0001
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+N_FOLDS = 5  # Number of folds for cross-validation
 
-# PCA dimensions
-PCA_OMICS_DIM = 256
-PCA_ESM2_DIM = 256
-PCA_ENFORMER_DIM = 256
-PCA_ORTHRUS_DIM = 256
-PCA_LATE_DIM = 512  # For late PCA (after concat)
+# PCA variance ratios (float < 1.0 = variance ratio, int >= 1 = number of components)
+PCA_OMICS_VARIANCE = 0.95  # Keep 95% variance
+PCA_ESM2_VARIANCE = 0.95
+PCA_ENFORMER_VARIANCE = 0.95
+PCA_ORTHRUS_VARIANCE = 0.95
+PCA_LATE_VARIANCE = 0.95  # For late PCA (after concat)
 
 # Set random seed
 import random
@@ -168,23 +170,144 @@ def load_hpo_labels():
 
 # ==================== Data Preparation ====================
 
+def create_fold_labels(genes, gene2hpos):
+    """
+    Create label matrix for a specific fold containing only labels present in that fold.
+    
+    Args:
+        genes: List of gene symbols in this fold
+        gene2hpos: Dictionary mapping genes to HPO terms
+    
+    Returns:
+        Y: Label matrix (n_genes, n_labels_in_fold)
+        hpo2idx: Mapping from HPO term to index in Y
+        hpo_terms: List of HPO terms in this fold
+    """
+    # Get all HPO terms present in this fold
+    hpo_terms = sorted({h for g in genes for h in gene2hpos[g]})
+    hpo2idx = {h: i for i, h in enumerate(hpo_terms)}
+    
+    # Create label matrix
+    Y = np.zeros((len(genes), len(hpo_terms)), dtype=np.float32)
+    for i, g in enumerate(genes):
+        for h in gene2hpos[g]:
+            Y[i, hpo2idx[h]] = 1.0
+    
+    return Y, hpo2idx, hpo_terms
+
+
+def apply_pca_to_fold(X_train, X_val, pca_mode, pca_var, embedding_dims, seed=SEED):
+    """
+    Apply PCA to training and validation data for a fold.
+    
+    Args:
+        X_train: Training features
+        X_val: Validation features
+        pca_mode: 'none', 'early_pca', 'late_pca'
+        pca_var: PCA variance ratio (float < 1.0) or n_components (int >= 1)
+                 For late_pca: single value
+                 For early_pca: dict with values for each embedding
+        embedding_dims: Dict with dimensions of each embedding type
+        seed: Random seed
+    
+    Returns:
+        X_train_pca, X_val_pca, pca_models
+    """
+    pca_models = {}
+    
+    if pca_mode == "none":
+        return X_train, X_val, pca_models
+    
+    elif pca_mode == "late_pca":
+        # Apply PCA to concatenated features
+        concat_dim = X_train.shape[1]
+        
+        print(f"  Late PCA: {concat_dim} -> auto (variance={pca_var})")
+        pca_late = PCA(n_components=pca_var, random_state=seed)
+        X_train_pca = pca_late.fit_transform(X_train)
+        X_val_pca = pca_late.transform(X_val)
+        print(f"    Selected {pca_late.n_components_} components")
+        print(f"    Explained variance: {pca_late.explained_variance_ratio_.sum():.4f}")
+        pca_models['late'] = pca_late
+        
+        return X_train_pca, X_val_pca, pca_models
+    
+    elif pca_mode == "early_pca":
+        # Split concatenated features back into individual embeddings
+        omics_dim = embedding_dims['omics_dim']
+        esm2_dim = embedding_dims['esm2_dim']
+        enformer_dim = embedding_dims['enformer_dim']
+        orthrus_dim = embedding_dims['orthrus_dim']
+        
+        # Split train
+        X_omics_train = X_train[:, :omics_dim]
+        X_esm2_train = X_train[:, omics_dim:omics_dim+esm2_dim]
+        X_enformer_train = X_train[:, omics_dim+esm2_dim:omics_dim+esm2_dim+enformer_dim]
+        X_orthrus_train = X_train[:, omics_dim+esm2_dim+enformer_dim:]
+        
+        # Split val
+        X_omics_val = X_val[:, :omics_dim]
+        X_esm2_val = X_val[:, omics_dim:omics_dim+esm2_dim]
+        X_enformer_val = X_val[:, omics_dim+esm2_dim:omics_dim+esm2_dim+enformer_dim]
+        X_orthrus_val = X_val[:, omics_dim+esm2_dim+enformer_dim:]
+        
+        # Apply PCA to each embedding
+        print(f"  Omics PCA: {omics_dim} -> auto (variance={pca_var['omics']})")
+        pca_omics = PCA(n_components=pca_var['omics'], random_state=seed)
+        X_omics_train = pca_omics.fit_transform(X_omics_train)
+        X_omics_val = pca_omics.transform(X_omics_val)
+        print(f"    Selected {pca_omics.n_components_} components, variance: {pca_omics.explained_variance_ratio_.sum():.4f}")
+        pca_models['omics'] = pca_omics
+        
+        print(f"  ESM2 PCA: {esm2_dim} -> auto (variance={pca_var['esm2']})")
+        pca_esm2 = PCA(n_components=pca_var['esm2'], random_state=seed)
+        X_esm2_train = pca_esm2.fit_transform(X_esm2_train)
+        X_esm2_val = pca_esm2.transform(X_esm2_val)
+        print(f"    Selected {pca_esm2.n_components_} components, variance: {pca_esm2.explained_variance_ratio_.sum():.4f}")
+        pca_models['esm2'] = pca_esm2
+        
+        print(f"  Enformer PCA: {enformer_dim} -> auto (variance={pca_var['enformer']})")
+        pca_enformer = PCA(n_components=pca_var['enformer'], random_state=seed)
+        X_enformer_train = pca_enformer.fit_transform(X_enformer_train)
+        X_enformer_val = pca_enformer.transform(X_enformer_val)
+        print(f"    Selected {pca_enformer.n_components_} components, variance: {pca_enformer.explained_variance_ratio_.sum():.4f}")
+        pca_models['enformer'] = pca_enformer
+        
+        print(f"  Orthrus PCA: {orthrus_dim} -> auto (variance={pca_var['orthrus']})")
+        pca_orthrus = PCA(n_components=pca_var['orthrus'], random_state=seed)
+        X_orthrus_train = pca_orthrus.fit_transform(X_orthrus_train)
+        X_orthrus_val = pca_orthrus.transform(X_orthrus_val)
+        print(f"    Selected {pca_orthrus.n_components_} components, variance: {pca_orthrus.explained_variance_ratio_.sum():.4f}")
+        pca_models['orthrus'] = pca_orthrus
+        
+        # Concatenate
+        X_train_pca = np.concatenate([X_omics_train, X_esm2_train, X_enformer_train, X_orthrus_train], axis=1)
+        X_val_pca = np.concatenate([X_omics_val, X_esm2_val, X_enformer_val, X_orthrus_val], axis=1)
+        print(f"    Final concatenated dimension: {X_train_pca.shape[1]}")
+        
+        return X_train_pca, X_val_pca, pca_models
+    
+    return X_train, X_val, pca_models
+
+
 def prepare_data_4_embeddings(esm2_model="650M", orthrus_track="4track", 
                                fusion_mode="concat", pca_mode="none",
-                               pca_omics_dim=PCA_OMICS_DIM, pca_esm2_dim=PCA_ESM2_DIM,
-                               pca_enformer_dim=PCA_ENFORMER_DIM, pca_orthrus_dim=PCA_ORTHRUS_DIM,
-                               pca_late_dim=PCA_LATE_DIM):
+                               pca_omics_var=PCA_OMICS_VARIANCE, pca_esm2_var=PCA_ESM2_VARIANCE,
+                               pca_enformer_var=PCA_ENFORMER_VARIANCE, pca_orthrus_var=PCA_ORTHRUS_VARIANCE,
+                               pca_late_var=PCA_LATE_VARIANCE):
     """
-    Load 4 embeddings and prepare data for training.
+    Load 4 embeddings and prepare data for 5-fold cross-validation.
+    Note: Does NOT build HPO label matrix here - labels will be created per fold.
     
     Args:
         esm2_model: ESM2 model size ('8M', '35M', '650M')
         orthrus_track: Orthrus track type ('4track' or '6track')
         fusion_mode: 'add' or 'concat'
         pca_mode: 'none', 'early_pca', 'late_pca' (only for concat mode)
-        pca_*_dim: PCA dimensions for each embedding (early_pca) or total (late_pca)
+        pca_*_var: PCA variance ratio (float < 1.0) or n_components (int >= 1)
     
     Returns:
-        X_train, Y_train, X_val, Y_val, X_test, Y_test, pca_models (if pca applied)
+        X (features), genes_common (gene list), gene2hpos (HPO labels dict)
     """
     print("=" * 70)
     print("Loading 4 Embeddings: Omics + ESM2 + Enformer + Orthrus")
@@ -214,12 +337,6 @@ def prepare_data_4_embeddings(esm2_model="650M", orthrus_track="4track",
     
     genes_common = sorted(genes_omics & genes_hpo & genes_esm2 & genes_enformer & genes_orthrus)
     print(f"\nGenes with ALL 5 sources: {len(genes_common)}")
-    
-    # Build HPO term index
-    hpo_terms = sorted({h for g in genes_common for h in gene2hpos[g]})
-    hpo2idx = {h: i for i, h in enumerate(hpo_terms)}
-    num_hpo = len(hpo_terms)
-    print(f"Number of HPO terms: {num_hpo}")
     
     # Get dimensions
     sample_gene = genes_common[0]
@@ -255,7 +372,6 @@ def prepare_data_4_embeddings(esm2_model="650M", orthrus_track="4track",
     X_esm2 = np.zeros((N, esm2_dim), dtype=np.float32)
     X_enformer = np.zeros((N, enformer_dim), dtype=np.float32)
     X_orthrus = np.zeros((N, orthrus_dim), dtype=np.float32)
-    Y = np.zeros((N, num_hpo), dtype=np.float32)
     
     for i, g in enumerate(genes_common):
         if (i + 1) % 500 == 0:
@@ -265,9 +381,6 @@ def prepare_data_4_embeddings(esm2_model="650M", orthrus_track="4track",
         X_esm2[i] = gene2esm2[g].astype(np.float32)
         X_enformer[i] = load_enformer_embedding(g)
         X_orthrus[i] = gene2orthrus[g].astype(np.float32)
-        
-        for h in gene2hpos[g]:
-            Y[i, hpo2idx[h]] = 1.0
     
     print(f"  Done! Collected all embeddings.")
     
@@ -275,24 +388,7 @@ def prepare_data_4_embeddings(esm2_model="650M", orthrus_track="4track",
     del gene2esm2, gene2orthrus
     gc.collect()
     
-    # ==================== Train/Val/Test Split ====================
-    print("\nSplitting data (70/15/15)...")
-    indices = np.arange(N)
-    idx_train, idx_tmp = train_test_split(indices, test_size=0.3, random_state=SEED)
-    idx_val, idx_test = train_test_split(idx_tmp, test_size=0.5, random_state=SEED)
-    
-    print(f"Split sizes: Train={len(idx_train)}, Val={len(idx_val)}, Test={len(idx_test)}")
-    
-    # Split each embedding
-    X_omics_train, X_omics_val, X_omics_test = X_omics[idx_train], X_omics[idx_val], X_omics[idx_test]
-    X_esm2_train, X_esm2_val, X_esm2_test = X_esm2[idx_train], X_esm2[idx_val], X_esm2[idx_test]
-    X_enformer_train, X_enformer_val, X_enformer_test = X_enformer[idx_train], X_enformer[idx_val], X_enformer[idx_test]
-    X_orthrus_train, X_orthrus_val, X_orthrus_test = X_orthrus[idx_train], X_orthrus[idx_val], X_orthrus[idx_test]
-    Y_train, Y_val, Y_test = Y[idx_train], Y[idx_val], Y[idx_test]
-    
-    pca_models = {}
-    
-    # ==================== Fusion ====================
+    # ==================== Fusion (all data) ====================
     if fusion_mode == "add":
         print("\n" + "=" * 70)
         print("Applying ADD Fusion (with padding)")
@@ -305,105 +401,31 @@ def prepare_data_4_embeddings(esm2_model="650M", orthrus_track="4track",
                 result += padded
             return result
         
-        X_train = pad_and_add(X_omics_train, X_esm2_train, X_enformer_train, X_orthrus_train, max_dim=max_dim)
-        X_val = pad_and_add(X_omics_val, X_esm2_val, X_enformer_val, X_orthrus_val, max_dim=max_dim)
-        X_test = pad_and_add(X_omics_test, X_esm2_test, X_enformer_test, X_orthrus_test, max_dim=max_dim)
+        X = pad_and_add(X_omics, X_esm2, X_enformer, X_orthrus, max_dim=max_dim)
+        print(f"Final dimension: {X.shape[1]}")
         
-        print(f"Final dimension: {X_train.shape[1]}")
+    else:  # concat - no PCA yet (will be done per fold)
+        print("\n" + "=" * 70)
+        print("Applying CONCAT")
+        print("=" * 70)
         
-    else:  # concat
-        if pca_mode == "early_pca":
-            print("\n" + "=" * 70)
-            print("Applying EARLY PCA (PCA each embedding, then concat)")
-            print("=" * 70)
-            
-            # PCA for Omics
-            pca_omics_dim_adj = min(pca_omics_dim, omics_dim, len(idx_train))
-            print(f"\nOmics PCA: {omics_dim} -> {pca_omics_dim_adj}")
-            pca_omics = PCA(n_components=pca_omics_dim_adj, random_state=SEED)
-            X_omics_train = pca_omics.fit_transform(X_omics_train)
-            X_omics_val = pca_omics.transform(X_omics_val)
-            X_omics_test = pca_omics.transform(X_omics_test)
-            print(f"  Explained variance: {pca_omics.explained_variance_ratio_.sum():.4f}")
-            pca_models['omics'] = pca_omics
-            
-            # PCA for ESM2
-            pca_esm2_dim_adj = min(pca_esm2_dim, esm2_dim, len(idx_train))
-            print(f"\nESM2 PCA: {esm2_dim} -> {pca_esm2_dim_adj}")
-            pca_esm2 = PCA(n_components=pca_esm2_dim_adj, random_state=SEED)
-            X_esm2_train = pca_esm2.fit_transform(X_esm2_train)
-            X_esm2_val = pca_esm2.transform(X_esm2_val)
-            X_esm2_test = pca_esm2.transform(X_esm2_test)
-            print(f"  Explained variance: {pca_esm2.explained_variance_ratio_.sum():.4f}")
-            pca_models['esm2'] = pca_esm2
-            
-            # PCA for Enformer
-            pca_enformer_dim_adj = min(pca_enformer_dim, enformer_dim, len(idx_train))
-            print(f"\nEnformer PCA: {enformer_dim} -> {pca_enformer_dim_adj}")
-            pca_enformer = PCA(n_components=pca_enformer_dim_adj, random_state=SEED)
-            X_enformer_train = pca_enformer.fit_transform(X_enformer_train)
-            X_enformer_val = pca_enformer.transform(X_enformer_val)
-            X_enformer_test = pca_enformer.transform(X_enformer_test)
-            print(f"  Explained variance: {pca_enformer.explained_variance_ratio_.sum():.4f}")
-            pca_models['enformer'] = pca_enformer
-            
-            # PCA for Orthrus
-            pca_orthrus_dim_adj = min(pca_orthrus_dim, orthrus_dim, len(idx_train))
-            print(f"\nOrthrus PCA: {orthrus_dim} -> {pca_orthrus_dim_adj}")
-            pca_orthrus = PCA(n_components=pca_orthrus_dim_adj, random_state=SEED)
-            X_orthrus_train = pca_orthrus.fit_transform(X_orthrus_train)
-            X_orthrus_val = pca_orthrus.transform(X_orthrus_val)
-            X_orthrus_test = pca_orthrus.transform(X_orthrus_test)
-            print(f"  Explained variance: {pca_orthrus.explained_variance_ratio_.sum():.4f}")
-            pca_models['orthrus'] = pca_orthrus
-            
-            # Concatenate
-            X_train = np.concatenate([X_omics_train, X_esm2_train, X_enformer_train, X_orthrus_train], axis=1)
-            X_val = np.concatenate([X_omics_val, X_esm2_val, X_enformer_val, X_orthrus_val], axis=1)
-            X_test = np.concatenate([X_omics_test, X_esm2_test, X_enformer_test, X_orthrus_test], axis=1)
-            
-            final_dim = X_train.shape[1]
-            print(f"\nFinal concatenated dimension: {pca_omics_dim_adj} + {pca_esm2_dim_adj} + {pca_enformer_dim_adj} + {pca_orthrus_dim_adj} = {final_dim}")
-            
-        elif pca_mode == "late_pca":
-            print("\n" + "=" * 70)
-            print("Applying LATE PCA (concat first, then PCA)")
-            print("=" * 70)
-            
-            # Concatenate first
-            X_train_concat = np.concatenate([X_omics_train, X_esm2_train, X_enformer_train, X_orthrus_train], axis=1)
-            X_val_concat = np.concatenate([X_omics_val, X_esm2_val, X_enformer_val, X_orthrus_val], axis=1)
-            X_test_concat = np.concatenate([X_omics_test, X_esm2_test, X_enformer_test, X_orthrus_test], axis=1)
-            
-            concat_dim = X_train_concat.shape[1]
-            print(f"Concatenated dimension: {concat_dim}")
-            
-            # Apply PCA
-            pca_late_dim_adj = min(pca_late_dim, concat_dim, len(idx_train))
-            print(f"Late PCA: {concat_dim} -> {pca_late_dim_adj}")
-            pca_late = PCA(n_components=pca_late_dim_adj, random_state=SEED)
-            X_train = pca_late.fit_transform(X_train_concat)
-            X_val = pca_late.transform(X_val_concat)
-            X_test = pca_late.transform(X_test_concat)
-            print(f"  Explained variance: {pca_late.explained_variance_ratio_.sum():.4f}")
-            pca_models['late'] = pca_late
-            
-            print(f"\nFinal dimension: {X_train.shape[1]}")
-            
-        else:  # no PCA
-            print("\n" + "=" * 70)
-            print("Applying CONCAT (no PCA)")
-            print("=" * 70)
-            
-            X_train = np.concatenate([X_omics_train, X_esm2_train, X_enformer_train, X_orthrus_train], axis=1)
-            X_val = np.concatenate([X_omics_val, X_esm2_val, X_enformer_val, X_orthrus_val], axis=1)
-            X_test = np.concatenate([X_omics_test, X_esm2_test, X_enformer_test, X_orthrus_test], axis=1)
-            
-            print(f"Final dimension: {X_train.shape[1]}")
+        X = np.concatenate([X_omics, X_esm2, X_enformer, X_orthrus], axis=1)
+        print(f"Final dimension: {X.shape[1]}")
     
-    print(f"\nFinal data shapes: X_train={X_train.shape}, Y_train={Y_train.shape}")
+    print(f"\nFinal data shape: X={X.shape}")
+    if fusion_mode == "concat":
+        print(f"PCA will be applied separately for each fold during cross-validation.")
+    else:
+        print(f"ADD mode: No PCA will be applied.")
     
-    return X_train.astype(np.float32), Y_train, X_val.astype(np.float32), Y_val, X_test.astype(np.float32), Y_test, pca_models
+    # Return features, gene list, and HPO labels dict
+    return X.astype(np.float32), genes_common, gene2hpos, {
+        'omics_dim': omics_dim,
+        'esm2_dim': esm2_dim,
+        'enformer_dim': enformer_dim,
+        'orthrus_dim': orthrus_dim,
+        'fusion_mode': fusion_mode
+    }
 
 
 # ==================== Dataset Class ====================
@@ -467,16 +489,16 @@ if __name__ == "__main__":
                         help='ESM2 model size (default: 650M)')
     parser.add_argument('--orthrus_track', type=str, default='4track', choices=['4track', '6track'],
                         help='Orthrus track type (default: 4track)')
-    parser.add_argument('--pca_omics', type=int, default=PCA_OMICS_DIM,
-                        help=f'PCA dim for Omics (early_pca, default: {PCA_OMICS_DIM})')
-    parser.add_argument('--pca_esm2', type=int, default=PCA_ESM2_DIM,
-                        help=f'PCA dim for ESM2 (early_pca, default: {PCA_ESM2_DIM})')
-    parser.add_argument('--pca_enformer', type=int, default=PCA_ENFORMER_DIM,
-                        help=f'PCA dim for Enformer (early_pca, default: {PCA_ENFORMER_DIM})')
-    parser.add_argument('--pca_orthrus', type=int, default=PCA_ORTHRUS_DIM,
-                        help=f'PCA dim for Orthrus (early_pca, default: {PCA_ORTHRUS_DIM})')
-    parser.add_argument('--pca_late', type=int, default=PCA_LATE_DIM,
-                        help=f'PCA dim for late_pca (default: {PCA_LATE_DIM})')
+    parser.add_argument('--pca_omics', type=float, default=PCA_OMICS_VARIANCE,
+                        help=f'PCA variance ratio for Omics (early_pca, default: {PCA_OMICS_VARIANCE})')
+    parser.add_argument('--pca_esm2', type=float, default=PCA_ESM2_VARIANCE,
+                        help=f'PCA variance ratio for ESM2 (early_pca, default: {PCA_ESM2_VARIANCE})')
+    parser.add_argument('--pca_enformer', type=float, default=PCA_ENFORMER_VARIANCE,
+                        help=f'PCA variance ratio for Enformer (early_pca, default: {PCA_ENFORMER_VARIANCE})')
+    parser.add_argument('--pca_orthrus', type=float, default=PCA_ORTHRUS_VARIANCE,
+                        help=f'PCA variance ratio for Orthrus (early_pca, default: {PCA_ORTHRUS_VARIANCE})')
+    parser.add_argument('--pca_late', type=float, default=PCA_LATE_VARIANCE,
+                        help=f'PCA variance ratio for late_pca (default: {PCA_LATE_VARIANCE})')
     parser.add_argument('--epochs', type=int, default=EPOCHS,
                         help=f'Number of epochs (default: {EPOCHS})')
     parser.add_argument('--lr', type=float, default=LEARNING_RATE,
@@ -497,13 +519,14 @@ if __name__ == "__main__":
     print(f"ESM2 Model: {args.esm2_model}")
     print(f"Orthrus Track: {args.orthrus_track}")
     if args.pca_mode == "early_pca":
-        print(f"PCA Dims: Omics={args.pca_omics}, ESM2={args.pca_esm2}, Enformer={args.pca_enformer}, Orthrus={args.pca_orthrus}")
+        print(f"PCA Variance Ratios: Omics={args.pca_omics}, ESM2={args.pca_esm2}, Enformer={args.pca_enformer}, Orthrus={args.pca_orthrus}")
     elif args.pca_mode == "late_pca":
-        print(f"Late PCA Dim: {args.pca_late}")
+        print(f"Late PCA Variance Ratio: {args.pca_late}")
     print(f"Epochs: {args.epochs}")
     print(f"Learning Rate: {args.lr}")
     print(f"Batch Size: {args.batch_size}")
     print(f"Hidden Dim: {args.hidden_dim}")
+    print(f"Number of Folds: {N_FOLDS}")
     print(f"Device: {DEVICE}")
     print("=" * 70 + "\n")
     
@@ -511,140 +534,264 @@ if __name__ == "__main__":
     res_dir = os.path.join(os.path.dirname(__file__), 'res')
     os.makedirs(res_dir, exist_ok=True)
     
-    # Load and prepare data
-    X_train, Y_train, X_val, Y_val, X_test, Y_test, pca_models = prepare_data_4_embeddings(
+    # Load and prepare data (returns features without labels)
+    X, genes_common, gene2hpos, embedding_dims = prepare_data_4_embeddings(
         esm2_model=args.esm2_model,
         orthrus_track=args.orthrus_track,
         fusion_mode=args.fusion_mode,
         pca_mode=args.pca_mode,
-        pca_omics_dim=args.pca_omics,
-        pca_esm2_dim=args.pca_esm2,
-        pca_enformer_dim=args.pca_enformer,
-        pca_orthrus_dim=args.pca_orthrus,
-        pca_late_dim=args.pca_late
+        pca_omics_var=args.pca_omics,
+        pca_esm2_var=args.pca_esm2,
+        pca_enformer_var=args.pca_enformer,
+        pca_orthrus_var=args.pca_orthrus,
+        pca_late_var=args.pca_late
     )
     
-    # Create datasets and dataloaders
-    train_dataset = GeneHPODataset(X_train, Y_train)
-    val_dataset = GeneHPODataset(X_val, Y_val)
-    test_dataset = GeneHPODataset(X_test, Y_test)
-    
-    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True)
-    val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False)
-    test_loader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False)
-    
-    print(f"\nDataLoader Batches: Train={len(train_loader)}, Val={len(val_loader)}, Test={len(test_loader)}")
-    
-    # Initialize model
-    in_dim = X_train.shape[1]
-    out_dim = Y_train.shape[1]
-    
-    model = HPOClassifier(
-        input_size=in_dim,
-        hidden_size=args.hidden_dim,
-        out_size=out_dim
-    )
-    model.to(DEVICE)
-    print("\nModel Architecture:\n", model)
-    print(f"Input dim: {in_dim}, Hidden dim: {args.hidden_dim}, Output dim: {out_dim}")
-    
-    # Loss and optimizer
-    criterion = nn.BCEWithLogitsLoss()
-    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
-    
-    # Training loop
-    print("\nStarting Training...")
-    best_val_auprc = 0.0
-    
-    train_losses = []
-    val_losses = []
-    train_auprcs = []
-    val_auprcs = []
-    
-    # Model save paths
+    # Prepare PCA variance config
     if args.pca_mode == "early_pca":
-        prefix = f"4emb_{args.fusion_mode}_early_{args.pca_omics}_{args.pca_esm2}_{args.pca_enformer}_{args.pca_orthrus}_{args.esm2_model}_{args.orthrus_track}"
+        pca_var_config = {
+            'omics': args.pca_omics,
+            'esm2': args.pca_esm2,
+            'enformer': args.pca_enformer,
+            'orthrus': args.pca_orthrus
+        }
     elif args.pca_mode == "late_pca":
-        prefix = f"4emb_{args.fusion_mode}_late_{args.pca_late}_{args.esm2_model}_{args.orthrus_track}"
+        pca_var_config = args.pca_late
     else:
-        prefix = f"4emb_{args.fusion_mode}_{args.esm2_model}_{args.orthrus_track}"
+        pca_var_config = None
     
-    model_save_path = os.path.join(res_dir, f'best_{prefix}.pth')
-    pca_save_path = os.path.join(res_dir, f'pca_{prefix}.pkl') if pca_models else None
-    
-    for epoch in range(args.epochs):
-        model.train()
-        total_loss = 0.0
-        
-        for X_batch, Y_batch in train_loader:
-            X_batch, Y_batch = X_batch.to(DEVICE), Y_batch.to(DEVICE)
-            
-            optimizer.zero_grad()
-            outputs = model(X_batch)
-            loss = criterion(outputs, Y_batch)
-            total_loss += loss.item()
-            
-            loss.backward()
-            optimizer.step()
-        
-        # Evaluate
-        train_loss, train_auprc, _, _ = evaluate(model, train_loader, criterion, DEVICE)
-        val_loss, val_auprc, _, _ = evaluate(model, val_loader, criterion, DEVICE)
-        
-        train_losses.append(train_loss)
-        val_losses.append(val_loss)
-        train_auprcs.append(train_auprc)
-        val_auprcs.append(val_auprc)
-        
-        print(f"Epoch {epoch+1}/{args.epochs}: "
-              f"Train Loss: {train_loss:.4f} | "
-              f"Train AUPRC: {train_auprc:.4f} | "
-              f"Val Loss: {val_loss:.4f} | "
-              f"Val AUPRC: {val_auprc:.4f}")
-        
-        # Save best model
-        if val_auprc > best_val_auprc:
-            best_val_auprc = val_auprc
-            torch.save(model.state_dict(), model_save_path)
-            if pca_models:
-                joblib.dump(pca_models, pca_save_path)
-            print(f"  -> New best model saved! Val AUPRC: {val_auprc:.4f}")
-    
-    # Final test evaluation
+    # ==================== 5-Fold Cross-Validation ====================
     print("\n" + "=" * 70)
-    print("Final Test Evaluation")
+    print(f"Starting {N_FOLDS}-Fold Cross-Validation")
     print("=" * 70)
-    print(f"Loading best model from: {model_save_path}")
-    model.load_state_dict(torch.load(model_save_path))
     
-    test_loss, test_auprc, test_outputs, test_targets = evaluate(model, test_loader, criterion, DEVICE)
+    kfold = KFold(n_splits=N_FOLDS, shuffle=True, random_state=SEED)
+    genes_array = np.array(genes_common)
     
-    print("-" * 50)
-    print(f"Final Test Loss (Best Model): {test_loss:.4f}")
-    print(f"Final Test AUPRC (Best Model): {test_auprc:.4f}")
-    print("-" * 50)
+    fold_results = []
+    all_fold_outputs = []
+    all_fold_targets = []
     
-    # Generate visualization plots
-    print("\nGenerating visualization plots...")
+    for fold_idx, (train_idx, val_idx) in enumerate(kfold.split(X)):
+        print("\n" + "=" * 70)
+        print(f"Fold {fold_idx + 1}/{N_FOLDS}")
+        print("=" * 70)
+        
+        # Split data
+        X_train_fold = X[train_idx]
+        X_val_fold = X[val_idx]
+        genes_train = genes_array[train_idx].tolist()
+        genes_val = genes_array[val_idx].tolist()
+        
+        print(f"Train samples: {len(genes_train)}, Val samples: {len(genes_val)}")
+        
+        # Apply PCA for this fold (only for concat mode)
+        if embedding_dims['fusion_mode'] == 'concat':
+            print(f"\nApplying PCA for fold {fold_idx + 1}...")
+            X_train_fold, X_val_fold, pca_models_fold = apply_pca_to_fold(
+                X_train_fold, X_val_fold, args.pca_mode, pca_var_config, embedding_dims, SEED
+            )
+        else:
+            print(f"\nADD mode: Skipping PCA for fold {fold_idx + 1}")
+            pca_models_fold = {}
+        
+        # Create fold-specific labels (only labels present in training set)
+        print(f"\nCreating fold-specific labels...")
+        Y_train_fold, hpo2idx_train, hpo_terms_train = create_fold_labels(genes_train, gene2hpos)
+        print(f"  Training set: {len(hpo_terms_train)} HPO terms")
+        
+        # Create validation labels using TRAINING set's HPO terms
+        # (validation samples may have labels not seen in training - those are ignored)
+        Y_val_fold = np.zeros((len(genes_val), len(hpo_terms_train)), dtype=np.float32)
+        for i, g in enumerate(genes_val):
+            for h in gene2hpos[g]:
+                if h in hpo2idx_train:  # Only include if seen in training
+                    Y_val_fold[i, hpo2idx_train[h]] = 1.0
+        
+        print(f"  Created label matrices: Train={Y_train_fold.shape}, Val={Y_val_fold.shape}")
+        
+        # Create datasets and dataloaders
+        train_dataset = GeneHPODataset(X_train_fold, Y_train_fold)
+        val_dataset = GeneHPODataset(X_val_fold, Y_val_fold)
+        
+        train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True)
+        val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False)
+        
+        # Initialize model for this fold
+        in_dim = X_train_fold.shape[1]
+        out_dim = Y_train_fold.shape[1]
+        
+        print(f"\nInitializing model: Input dim={in_dim}, Hidden dim={args.hidden_dim}, Output dim={out_dim}")
+        model = ImprovedHPOClassifier(
+            input_size=in_dim,
+            out_size=out_dim,
+            hidden_size=args.hidden_dim,
+        )
+        model.to(DEVICE)
+        
+        # Loss and optimizer
+        criterion = nn.BCEWithLogitsLoss()
+        optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
+        
+        # Training loop for this fold
+        print(f"\nTraining fold {fold_idx + 1}...")
+        best_val_auprc = 0.0
+        best_model_state = None
+        
+        train_losses = []
+        val_losses = []
+        train_auprcs = []
+        val_auprcs = []
+        
+        for epoch in range(args.epochs):
+            model.train()
+            total_loss = 0.0
+            
+            for X_batch, Y_batch in train_loader:
+                X_batch, Y_batch = X_batch.to(DEVICE), Y_batch.to(DEVICE)
+                
+                optimizer.zero_grad()
+                outputs = model(X_batch)
+                loss = criterion(outputs, Y_batch)
+                total_loss += loss.item()
+                
+                loss.backward()
+                optimizer.step()
+            
+            # Evaluate
+            train_loss, train_auprc, _, _ = evaluate(model, train_loader, criterion, DEVICE)
+            val_loss, val_auprc, _, _ = evaluate(model, val_loader, criterion, DEVICE)
+            
+            train_losses.append(train_loss)
+            val_losses.append(val_loss)
+            train_auprcs.append(train_auprc)
+            val_auprcs.append(val_auprc)
+            
+            if (epoch + 1) % 10 == 0 or epoch == 0:
+                print(f"  Epoch {epoch+1}/{args.epochs}: "
+                      f"Train Loss: {train_loss:.4f} | "
+                      f"Train AUPRC: {train_auprc:.4f} | "
+                      f"Val Loss: {val_loss:.4f} | "
+                      f"Val AUPRC: {val_auprc:.4f}")
+            
+            # Save best model for this fold
+            if val_auprc > best_val_auprc:
+                best_val_auprc = val_auprc
+                best_model_state = model.state_dict().copy()
+        
+        # Load best model for this fold
+        model.load_state_dict(best_model_state)
+        
+        # Final evaluation on this fold
+        val_loss, val_auprc, val_outputs, val_targets = evaluate(model, val_loader, criterion, DEVICE)
+        
+        print(f"\n  Fold {fold_idx + 1} Best Val AUPRC: {val_auprc:.4f}")
+        
+        # Store results
+        fold_results.append({
+            'fold': fold_idx + 1,
+            'val_auprc': val_auprc,
+            'val_loss': val_loss,
+            'n_train': len(genes_train),
+            'n_val': len(genes_val),
+            'n_labels': len(hpo_terms_train)
+        })
+        
+        all_fold_outputs.append(val_outputs)
+        all_fold_targets.append(val_targets)
+        
+        # Save fold-specific model and results
+        if args.fusion_mode == "add":
+            prefix = f"4emb_add_{args.esm2_model}_{args.orthrus_track}"
+        elif args.pca_mode == "early_pca":
+            prefix = f"4emb_{args.fusion_mode}_early_{args.pca_omics}_{args.pca_esm2}_{args.pca_enformer}_{args.pca_orthrus}_{args.esm2_model}_{args.orthrus_track}"
+        elif args.pca_mode == "late_pca":
+            prefix = f"4emb_{args.fusion_mode}_late_{args.pca_late}_{args.esm2_model}_{args.orthrus_track}"
+        else:
+            prefix = f"4emb_{args.fusion_mode}_{args.esm2_model}_{args.orthrus_track}"
+        
+        fold_prefix = f"{prefix}_fold{fold_idx+1}"
+        model_save_path = os.path.join(res_dir, f'best_{fold_prefix}.pth')
+        torch.save(best_model_state, model_save_path)
+        
+        if pca_models_fold:
+            pca_save_path = os.path.join(res_dir, f'pca_{fold_prefix}.pkl')
+            joblib.dump(pca_models_fold, pca_save_path)
+        
+        # Save training curves for this fold
+        plot_training_curves(train_losses, val_losses, train_auprcs, val_auprcs,
+                            save_path=os.path.join(res_dir, f'{fold_prefix}_training_curves.png'))
+        
+        # Clear memory
+        del model, optimizer, train_dataset, val_dataset, train_loader, val_loader
+        del X_train_fold, X_val_fold, Y_train_fold, Y_val_fold
+        gc.collect()
+        torch.cuda.empty_cache() if torch.cuda.is_available() else None
     
-    plot_training_curves(train_losses, val_losses, train_auprcs, val_auprcs,
-                        save_path=os.path.join(res_dir, f'{prefix}_training_curves.png'))
+    # ==================== Cross-Validation Summary ====================
+    print("\n" + "=" * 70)
+    print("5-Fold Cross-Validation Summary")
+    print("=" * 70)
     
-    plot_roc_curves(test_targets, test_outputs, num_classes_to_plot=5,
-                   save_path=os.path.join(res_dir, f'{prefix}_roc_curves.png'))
+    val_auprcs = [r['val_auprc'] for r in fold_results]
+    mean_auprc = np.mean(val_auprcs)
+    std_auprc = np.std(val_auprcs)
     
-    plot_prediction_distribution(test_targets, test_outputs,
-                                save_path=os.path.join(res_dir, f'{prefix}_prediction_distribution.png'))
+    print(f"\nResults per fold:")
+    for r in fold_results:
+        print(f"  Fold {r['fold']}: Val AUPRC = {r['val_auprc']:.4f}, "
+              f"Train samples = {r['n_train']}, Val samples = {r['n_val']}, "
+              f"Labels = {r['n_labels']}")
     
-    plot_top_k_accuracy(test_targets, test_outputs, k_values=[1, 3, 5, 10, 20, 50],
-                       save_path=os.path.join(res_dir, f'{prefix}_top_k_accuracy.png'))
+    print(f"\nOverall Performance:")
+    print(f"  Mean Val AUPRC: {mean_auprc:.4f} ± {std_auprc:.4f}")
+    print(f"  Min Val AUPRC: {min(val_auprcs):.4f}")
+    print(f"  Max Val AUPRC: {max(val_auprcs):.4f}")
     
-    plot_per_class_performance(test_targets, test_outputs, top_n=20,
-                              save_path=os.path.join(res_dir, f'{prefix}_auprc_boxplot.png'))
+    # Generate boxplot for cross-validation results
+    print(f"\nGenerating cross-validation boxplot...")
+    boxplot_path = os.path.join(res_dir, f'{prefix}_cv_boxplot.png')
+    plt.figure(figsize=(8, 6))
+    bp = plt.boxplot(val_auprcs, patch_artist=True, 
+                     boxprops=dict(facecolor='lightblue', color='blue'),
+                     medianprops=dict(color='red', linewidth=2),
+                     whiskerprops=dict(color='blue'),
+                     capprops=dict(color='blue'))
+    plt.scatter([1]*len(val_auprcs), val_auprcs, color='darkblue', s=50, alpha=0.6, zorder=3)
+    plt.title(f'5-Fold Cross-Validation AUPRC Scores\nMean: {mean_auprc:.4f} ± {std_auprc:.4f}', fontsize=12, fontweight='bold')
+    plt.ylabel('AUPRC', fontsize=11)
+    plt.xticks([1], ['5-Fold CV'], fontsize=10)
+    plt.grid(True, alpha=0.3, linestyle='--')
+    plt.ylim([min(val_auprcs) - 0.01, max(val_auprcs) + 0.01])
+    plt.tight_layout()
+    plt.savefig(boxplot_path, dpi=300, bbox_inches='tight')
+    plt.close()
+    print(f"  Boxplot saved to: {boxplot_path}")
     
-    print("\nAll visualization plots have been generated!")
-    print(f"\nTraining completed!")
-    print(f"  Best model saved to: {model_save_path}")
-    if pca_save_path:
-        print(f"  PCA models saved to: {pca_save_path}")
-    print(f"  Plots saved to: {res_dir}/")
+    # Save summary
+    summary_path = os.path.join(res_dir, f'{prefix}_cv_summary.txt')
+    with open(summary_path, 'w') as f:
+        f.write("5-Fold Cross-Validation Summary\n")
+        f.write("=" * 70 + "\n\n")
+        f.write(f"Configuration:\n")
+        f.write(f"  Fusion mode: {args.fusion_mode}\n")
+        f.write(f"  PCA mode: {args.pca_mode}\n")
+        f.write(f"  ESM2 model: {args.esm2_model}\n")
+        f.write(f"  Orthrus track: {args.orthrus_track}\n")
+        f.write(f"  Epochs: {args.epochs}\n")
+        f.write(f"  Learning rate: {args.lr}\n")
+        f.write(f"  Batch size: {args.batch_size}\n")
+        f.write(f"  Hidden dim: {args.hidden_dim}\n\n")
+        f.write("Results per fold:\n")
+        for r in fold_results:
+            f.write(f"  Fold {r['fold']}: Val AUPRC = {r['val_auprc']:.4f}, "
+                   f"Train samples = {r['n_train']}, Val samples = {r['n_val']}, "
+                   f"Labels = {r['n_labels']}\n")
+        f.write(f"\nOverall Performance:\n")
+        f.write(f"  Mean Val AUPRC: {mean_auprc:.4f} ± {std_auprc:.4f}\n")
+        f.write(f"  Min Val AUPRC: {min(val_auprcs):.4f}\n")
+        f.write(f"  Max Val AUPRC: {max(val_auprcs):.4f}\n")
+    
+    print(f"\nCross-validation completed!")
+    print(f"  Models saved to: {res_dir}/")
+    print(f"  Summary saved to: {summary_path}")
